@@ -1,0 +1,29 @@
+# ncatbot5 主配置模板
+# 用法：复制本文件为 config.yaml（与本文件同目录），再把 QQ 号改成你自己的。
+# 提示：凡是纯数字的标识类字段（QQ 号、token 等）都建议加引号写成字符串。
+
+# 机器人 QQ 号（NapCat 登录的那个）
+bot_uin: "10000"
+# 管理员（超管）QQ 号：只有这个号能发管理命令
+root: "10001"
+debug: false
+enable_webui_interaction: false
+
+adapters:
+  - type: napcat
+    platform: qq
+    enabled: true
+    config:
+      ws_uri: ws://localhost:3001
+      # 与 NapCat「WebSocket 服务器」配置里的 token 保持一致；NapCat 端留空这里也留空
+      ws_token: ""
+      # NapCat 手动启动时跳过自动安装/启动与 WebUI 接管
+      skip_setup: true
+      enable_webui: false
+
+plugin:
+  plugins_dir: plugins
+  load_plugin: false
+  plugin_whitelist: []
+  plugin_blacklist: []
+  auto_install_pip_deps: true

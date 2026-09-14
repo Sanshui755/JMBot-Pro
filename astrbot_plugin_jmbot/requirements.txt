@@ -1,0 +1,4 @@
+jmcomic
+img2pdf
+PyPDF2
+pyyaml

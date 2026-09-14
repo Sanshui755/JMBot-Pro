@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 运行时产物（下载缓存 / PDF / 日志）
+stock/
+pdf/
+encrypt_pdf/
+logs/
+*.log
+
+# 敏感配置与本机数据（用 *.example 模板代替）
+config.yaml
+jm_account.json
+pdf_password.txt
+data/
+
+# 其他
+NapCat.Shell/
+*.zip
+.DS_Store

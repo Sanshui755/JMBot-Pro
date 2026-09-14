@@ -1,0 +1,8 @@
+name = "JMBot"
+version = "1.3.0"
+main = "plugin.py"
+entry_class = "JMBot"
+author = "Sora-o-tobu"
+description = "禁漫本子下载机器人：群/私聊 /jm 批量下载，PDF 自动加密，下载路径可配置，产物保留3天自动清理"
+
+pip_dependencies = ["jmcomic", "PyYAML", "img2pdf", "PyPDF2"]

@@ -1,0 +1,34 @@
+{
+    "super_user_id": {
+        "description": "超管QQ号（管理命令仅此人可用）",
+        "type": "string",
+        "default": "",
+        "hint": "填写你自己的QQ号。留空则所有管理命令不可用。可在聊天中发送 /sid 获取自己的ID。",
+        "obvious_hint": true
+    },
+    "group_enabled": {
+        "description": "群聊下载开关",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后群聊中发送 /jm <id> 才会下载；也可由超管私聊发送 开启JMBot/关闭JMBot 切换。"
+    },
+    "pdf_encrypt": {
+        "description": "群聊PDF加密开关",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后群聊发送的PDF会加密；私聊发送的PDF始终不加密。"
+    },
+    "pdf_password": {
+        "description": "PDF加密密码",
+        "type": "string",
+        "default": "114514",
+        "secret": true,
+        "hint": "群聊加密PDF使用的密码，私聊发送的PDF不加密。"
+    },
+    "download_root": {
+        "description": "下载文件保存路径",
+        "type": "string",
+        "default": "",
+        "hint": "留空则保存到 用户目录\\JMBot-Downloads；其下会自动创建 stock（原图）/pdf/encrypt_pdf（加密PDF）三个文件夹。也可私聊超管发送「设置下载路径 路径」修改，旧文件会自动迁移。文件保留3天后自动删除。"
+    }
+}
