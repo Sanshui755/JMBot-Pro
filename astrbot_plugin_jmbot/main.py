@@ -80,7 +80,7 @@ DEFAULT_DOWNLOAD_ROOT = str(Path.home() / "JMBot-Downloads")
 LEGACY_DOWNLOAD_ROOTS: tuple[str, ...] = ()
 
 
-@register("astrbot_plugin_jmbot", "Sanshui755", "禁漫下载插件，批量下载/路径可配/自动清理", "1.3.5", "")
+@register("astrbot_plugin_jmbot", "Sanshui755", "禁漫下载插件，批量下载/路径可配/自动清理", "1.3.6", "")
 class JMBot(Star):
     """JMBot 插件"""
 
@@ -135,7 +135,7 @@ class JMBot(Star):
         self._background_tasks.add(cleanup_task)
         cleanup_task.add_done_callback(self._background_tasks.discard)
 
-        logger.info("JMBot v1.3.5 已加载（指令消息已隔离：屏蔽默认 LLM 与陪伴/记忆插件）")
+        logger.info("JMBot v1.3.6 已加载（指令消息已隔离：屏蔽默认 LLM 与陪伴/记忆插件）")
         logger.info(f"JMBot 插件超管: {self.super_user or '(未配置)'}")
         logger.info(f"JMBot 下载目录: {self.download_root}")
 
@@ -446,7 +446,7 @@ class JMBot(Star):
             event.stop_event()
 
     async def _on_private_message_impl(self, event: AstrMessageEvent):
-        text = event.message_str
+        text = event.message_str or ""
         user_id = str(event.get_sender_id())
         logger.info(f"私聊消息: {text} (from {user_id})")
 
@@ -465,6 +465,11 @@ class JMBot(Star):
 
         # 超管：归一化命令（JM 大小写、"登陆"错字），让下方分支稳定命中
         text = re.sub(r"(?i)^jm", "JM", text.strip()).replace("登陆", "登录")
+
+        # 空消息（图片/表情/戳一戳/纯空白等非文本内容）不属于 JMBot 指令，
+        # 直接放行，避免 "".splitlines()[0] 触发 IndexError
+        if not text:
+            return
 
         # 以 JM 开头或命中已知管理命令的消息一律认领：禁止默认 LLM 响应，
         # 即使命令拼写有误也由插件兜底提示，不落进 AI 聊天
