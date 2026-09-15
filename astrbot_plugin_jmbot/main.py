@@ -134,7 +134,8 @@ class JMBot(Star):
         self._background_tasks.add(cleanup_task)
         cleanup_task.add_done_callback(self._background_tasks.discard)
 
-        logger.info(f"JMBot 插件已加载，超管: {self.super_user or '(未配置)'}")
+        logger.info("JMBot v1.3.2 已加载（指令消息已屏蔽默认 LLM 回复）")
+        logger.info(f"JMBot 插件超管: {self.super_user or '(未配置)'}")
         logger.info(f"JMBot 下载目录: {self.download_root}")
 
     # ------------------------------------------------------------------
