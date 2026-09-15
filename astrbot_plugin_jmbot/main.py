@@ -267,6 +267,8 @@ class JMBot(Star):
     @filter.command("jm")
     async def cmd_jm(self, event: AstrMessageEvent, album_id: str = ""):
         """下载禁漫本子：/jm <id>，支持一条消息多个车号。"""
+        # 指令消息归 JMBot 处理：禁止 AstrBot 默认 LLM 再把指令当聊天回复一遍
+        event.should_call_llm(True)
         user_id = str(event.get_sender_id())
         is_group = not event.is_private_chat()
 
@@ -325,6 +327,9 @@ class JMBot(Star):
         if not re.match(r"/?jm\d+", text, re.IGNORECASE):
             return
 
+        # 命中 jm 车号形态，同样禁止默认 LLM 响应
+        event.should_call_llm(True)
+
         album_ids = self._parse_album_ids(text)
         if not album_ids:
             return
@@ -370,6 +375,10 @@ class JMBot(Star):
         if not self._check_admin(user_id):
             return
 
+        # 命中群聊管理命令时禁止默认 LLM 响应
+        if text in ("测试JMBot", "关闭JMBot", "开启JMBot"):
+            event.should_call_llm(True)
+
         if text == "测试JMBot":
             yield event.plain_result("插件JMBot测试成功")
         elif text == "关闭JMBot":
@@ -398,8 +407,19 @@ class JMBot(Star):
         if not self._check_admin(user_id):
             if user_id not in self._no_permission_notified:
                 self._no_permission_notified.add(user_id)
+                event.should_call_llm(True)
                 yield event.plain_result("你没有权限使用该命令，发送 /jm help 查看用法")
             return
+
+        # 命中本插件管理命令的消息禁止默认 LLM 响应（普通聊天不受影响）
+        first_line = text.splitlines()[0].strip()
+        if first_line in (
+            "测试JMBot", "打开加密", "关闭加密", "PDF密码", "下载路径",
+            "关闭JMBot", "开启JMBot", "JM帮助", "JM登录", "JM状态", "清除JM账号",
+        ) or first_line.startswith(
+            ("设置PDF密码", "设置下载路径", "设置JM账号", "设置JM密码")
+        ):
+            event.should_call_llm(True)
 
         if text == "测试JMBot":
             yield event.plain_result("JMBot测试成功")
