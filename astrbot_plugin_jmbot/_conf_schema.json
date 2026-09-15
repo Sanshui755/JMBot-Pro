@@ -25,6 +25,19 @@
         "secret": true,
         "hint": "群聊加密PDF使用的密码，私聊发送的PDF不加密。"
     },
+    "jm_username": {
+        "description": "JM 账号（禁漫用户名）",
+        "type": "string",
+        "default": "",
+        "hint": "禁漫天堂网站账号，与下面密码配套填写后，插件启动/重载时会自动登录，下载需登录的内容。也可私聊超管发送「设置JM账号 用户名」保存到本地；两处同时存在时，此处（WebUI 配置）优先。"
+    },
+    "jm_password": {
+        "description": "JM 密码",
+        "type": "string",
+        "default": "",
+        "secret": true,
+        "hint": "与 JM 账号配套。仅在本处与账号一起填写才会生效；也可私聊发送「设置JM密码 密码」保存到本地。"
+    },
     "download_root": {
         "description": "下载文件保存路径",
         "type": "string",

@@ -106,6 +106,7 @@ class JMBot(Star):
         self.jm_username: str = ""
         self.jm_password: str = ""
         self.jm_logged_in: bool = False
+        self.jm_cred_source: str = "无"  # 无 / 本地保存 / WebUI 配置
         self._background_tasks: set = set()
         # 已收到过"无权限"提示的私聊用户，每人只提示一次
         self._no_permission_notified: set[str] = set()
@@ -134,7 +135,7 @@ class JMBot(Star):
         self._background_tasks.add(cleanup_task)
         cleanup_task.add_done_callback(self._background_tasks.discard)
 
-        logger.info("JMBot v1.3.3 已加载（指令消息已屏蔽默认 LLM 回复）")
+        logger.info("JMBot v1.3.4 已加载（指令消息已屏蔽默认 LLM 回复）")
         logger.info(f"JMBot 插件超管: {self.super_user or '(未配置)'}")
         logger.info(f"JMBot 下载目录: {self.download_root}")
 
@@ -212,15 +213,25 @@ class JMBot(Star):
     # ------------------------------------------------------------------
 
     def _load_jm_account(self) -> None:
-        """从 data/jm_account.json 读取已保存的 JM 账号密码。"""
+        """读取 JM 账号密码：WebUI 插件配置优先，其次 data/jm_account.json。"""
+        self.jm_cred_source = "无"
         try:
             data = json.loads(self.jm_account_path.read_text(encoding="utf-8"))
             self.jm_username = str(data.get("username", "")).strip()
             self.jm_password = str(data.get("password", ""))
+            if self.jm_username and self.jm_password:
+                self.jm_cred_source = "本地保存"
         except FileNotFoundError:
             pass
         except (json.JSONDecodeError, OSError) as e:
             logger.warning(f"JM 账号文件读取失败: {e}")
+        # WebUI 插件配置中的 JM 账号密码优先于本地保存
+        cfg_user = str(self.config.get("jm_username") or "").strip()
+        cfg_pass = str(self.config.get("jm_password") or "")
+        if cfg_user and cfg_pass:
+            self.jm_username, self.jm_password = cfg_user, cfg_pass
+            self.jm_cred_source = "WebUI 配置"
+            logger.info("JM 账号已从 WebUI 插件配置读取（优先于本地保存）")
 
     def _save_jm_account(self) -> None:
         """把 JM 账号密码写入本地文件。"""
@@ -498,9 +509,14 @@ class JMBot(Star):
                 yield event.plain_result("用法：设置JM账号 用户名")
                 return
             self.jm_username = username
+            self.jm_cred_source = "本地保存"
             self._save_jm_account()
             self.jm_logged_in = False
-            yield event.plain_result(f"JM 账号已保存：{username}，请继续发送\"设置JM密码 密码\"")
+            tip = ""
+            if (str(self.config.get("jm_username") or "").strip()
+                    and str(self.config.get("jm_password") or "")):
+                tip = "\n注意：WebUI 插件配置中也填有 JM 账号，重启后将以 WebUI 配置优先。"
+            yield event.plain_result(f"JM 账号已保存：{username}，请继续发送\"设置JM密码 密码\"{tip}")
             return
 
         if text.startswith("设置JM密码"):
@@ -511,6 +527,7 @@ class JMBot(Star):
                 yield event.plain_result("用法：设置JM密码 密码")
                 return
             self.jm_password = password
+            self.jm_cred_source = "本地保存"
             self._save_jm_account()
             self.jm_logged_in = False
             yield event.plain_result("JM 密码已保存，正在尝试登录……")
@@ -520,7 +537,10 @@ class JMBot(Star):
 
         if text == "JM登录":
             if not self.jm_username or not self.jm_password:
-                yield event.plain_result("请先发送\"设置JM账号 用户名\"和\"设置JM密码 密码\"")
+                yield event.plain_result(
+                    "请先在 WebUI 插件配置中填写 JM 账号密码，"
+                    "或发送\"设置JM账号 用户名\"和\"设置JM密码 密码\""
+                )
                 return
             yield event.plain_result("正在登录 JM……")
             _, msg = await self._jm_login()
@@ -529,10 +549,11 @@ class JMBot(Star):
 
         if text == "JM状态":
             if not self.jm_username:
-                status = "未保存 JM 账号"
+                status = "未保存 JM 账号（可在 WebUI 插件配置中填写，或发送\"设置JM账号 用户名\"）"
             else:
                 status = (
                     f"账号：{self.jm_username}\n"
+                    f"账号来源：{self.jm_cred_source}\n"
                     f"登录状态：{'已登录' if self.jm_logged_in else '未登录'}"
                 )
             yield event.plain_result(status)
@@ -542,11 +563,16 @@ class JMBot(Star):
             self.jm_username = ""
             self.jm_password = ""
             self.jm_logged_in = False
+            self.jm_cred_source = "无"
             try:
                 self.jm_account_path.unlink()
             except FileNotFoundError:
                 pass
-            yield event.plain_result("已清除保存的 JM 账号密码")
+            msg = "已清除保存的 JM 账号密码"
+            if (str(self.config.get("jm_username") or "").strip()
+                    and str(self.config.get("jm_password") or "")):
+                msg += "\n注意：WebUI 插件配置中仍填有 JM 账号，重启插件后将继续使用；如需彻底清除请在 WebUI 中清空。"
+            yield event.plain_result(msg)
             return
 
         # 兜底：认领了 JMBot 命令但未命中任何已知命令（如拼写有误），
