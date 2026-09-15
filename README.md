@@ -2,12 +2,12 @@
 
 基于 QQ 机器人框架的禁漫（JM Comic）下载插件：在群聊或私聊中发送漫画 ID，机器人即自动完成下载、生成 PDF 并回传文件。支持批量下载、JM 账号登录、PDF 加密、下载路径自定义与产物定期清理。
 
-本项目提供两种相互独立的部署方式，**推荐使用方法一（AstrBot 插件）**——安装最简单，自带 WebUI 可视化配置，无需手动维护 NapCat 与 Python 环境：
+本项目提供两种相互独立的部署方式，**推荐使用方法一（NapCat + AstrBot 插件）**——自带 WebUI 可视化配置，Python 依赖自动安装，部署最简单：
 
-| 方式                                                            | 目录                                             | 适用场景                                        |
-| --------------------------------------------------------------- | ------------------------------------------------ | ----------------------------------------------- |
-| ⭐ [方法一：AstrBot 插件（推荐）](#方法一astrbot-插件推荐)       | [`astrbot_plugin_jmbot/`](astrbot_plugin_jmbot/) | 绝大多数用户：上传 zip 即可使用，WebUI 配置     |
-| [方法二：NcatBot 插件（JMBot_v5）](#方法二ncatbot-插件jmbot_v5) | [`JMBot_v5/`](JMBot_v5/)                         | 希望运行一个独立、轻量、不依赖 AstrBot 的机器人 |
+| 方式                                                                             | 目录                                             | 适用场景                                        |
+| -------------------------------------------------------------------------------- | ------------------------------------------------ | ----------------------------------------------- |
+| ⭐ [方法一：NapCat + AstrBot 插件（推荐）](#方法一napcat--astrbot-插件推荐)       | [`astrbot_plugin_jmbot/`](astrbot_plugin_jmbot/) | 绝大多数用户：上传 zip 即可使用，WebUI 配置     |
+| [方法二：NapCat + NcatBot 插件（JMBot_v5）](#方法二napcat--ncatbot-插件jmbot_v5) | [`JMBot_v5/`](JMBot_v5/)                         | 希望运行一个独立、轻量、不依赖 AstrBot 的机器人 |
 
 两种方式功能完全一致，可根据自己已有的机器人环境选择，无需都装。
 
@@ -59,14 +59,16 @@
 
 ---
 
-## 方法一：AstrBot 插件（推荐）
+## 方法一：NapCat + AstrBot 插件（推荐）
+
+架构链路：**QQ ← NapCat（QQ 协议端）← aiocqhttp → AstrBot（机器人框架）← 插件 → JMBot**。
 
 [ AstrBot ](https://github.com/AstrBotDevs/AstrBot)是一个开源的多平台 LLM 聊天机器人框架，自带 WebUI 管理界面。以插件方式安装本项目是**最简单的使用方式**：不需要写配置文件、不需要命令行、超管和各项开关都在网页上填写。
 
 ### 前置条件
 
-- 已安装并运行 [AstrBot](https://github.com/AstrBotDevs/AstrBot)（官方文档：[astrbot.app](https://astrbot.app)）
-- AstrBot 已接入一个消息平台（如 NapCat / aiocqhttp、QQ 官方机器人等）
+- 已安装并运行 [NapCat](https://napcat.napneko.icu/)（QQ 协议端，用于接入 QQ 消息）
+- 已安装并运行 [AstrBot](https://github.com/AstrBotDevs/AstrBot)（官方文档：[astrbot.app](https://astrbot.app)），并通过 aiocqhttp 适配器接入 NapCat
 
 ### 安装步骤
 
@@ -95,7 +97,7 @@ JM状态
 
 ---
 
-## 方法二：NcatBot 插件（JMBot_v5）
+## 方法二：NapCat + NcatBot 插件（JMBot_v5）
 
 适合希望运行**独立机器人**、不依赖 AstrBot 的用户。架构链路：**NapCat（QQ 协议端）← WebSocket → NcatBot（Python 框架）← 插件 → JMBot**。
 
@@ -170,7 +172,7 @@ cd JMBot_v5
 
 ```
 JMBot-Pro
-├── astrbot_plugin_jmbot/      # 方法一（推荐）：AstrBot 插件
+├── astrbot_plugin_jmbot/      # 方法一（推荐）：NapCat + AstrBot 插件
 │   ├── main.py                #   插件本体
 │   ├── _conf_schema.json      #   WebUI 配置项定义
 │   ├── metadata.yaml          #   插件元数据
@@ -189,7 +191,7 @@ JMBot-Pro
 
 ## 常见问题
 
-- **选哪种方式？** 没有特殊需求就选方法一（AstrBot 插件）：图形化配置、装完即用；只有想单独跑一个轻量机器人、或不想引入 AstrBot 时才用方法二。
+- **选哪种方式？** 没有特殊需求就选方法一（NapCat + AstrBot 插件）：图形化配置、装完即用；只有想单独跑一个轻量机器人、或不想引入 AstrBot 时才用方法二。
 - **提示域名解析失败**：JM 域名可能因网络环境无法解析。jmcomic 会自动获取可用域名；必要时可在 jmcomic 配置（`plugins/JMBot/config/config.yml`）的 `client.domain` 中手动指定可用域名，或为终端配置代理。
 - **登录返回 401**：请核对账号与密码，并确保每条设置命令单独发送。
 - **群聊中无响应**：群聊下载默认关闭，请先由超管私聊机器人发送 `开启JMBot`。
