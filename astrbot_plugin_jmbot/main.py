@@ -1,4 +1,4 @@
-﻿"""
+"""
 JMBot —— AstrBot 版禁漫下载插件
 
 群聊 / 私聊发送 ``/jm <id>``，机器人自动下载相册、生成 PDF 并发送文件。
@@ -80,7 +80,7 @@ DEFAULT_DOWNLOAD_ROOT = str(Path.home() / "JMBot-Downloads")
 LEGACY_DOWNLOAD_ROOTS: tuple[str, ...] = ()
 
 
-@register("astrbot_plugin_jmbot", "Sanshui755", "禁漫下载插件，批量下载/路径可配/自动清理", "1.3.1", "")
+@register("astrbot_plugin_jmbot", "Sanshui755", "禁漫下载插件，批量下载/路径可配/自动清理", "1.3.5", "")
 class JMBot(Star):
     """JMBot 插件"""
 
@@ -135,7 +135,7 @@ class JMBot(Star):
         self._background_tasks.add(cleanup_task)
         cleanup_task.add_done_callback(self._background_tasks.discard)
 
-        logger.info("JMBot v1.3.4 已加载（指令消息已屏蔽默认 LLM 回复）")
+        logger.info("JMBot v1.3.5 已加载（指令消息已隔离：屏蔽默认 LLM 与陪伴/记忆插件）")
         logger.info(f"JMBot 插件超管: {self.super_user or '(未配置)'}")
         logger.info(f"JMBot 下载目录: {self.download_root}")
 
@@ -276,11 +276,31 @@ class JMBot(Star):
     # /jm 下载指令（正式注册，群聊/私聊均可触发）
     # ------------------------------------------------------------------
 
-    @filter.command("jm")
+    @staticmethod
+    def _claim(event: AstrMessageEvent) -> None:
+        """JMBot 认领该消息：禁止默认 LLM 链路，并打上认领标记。
+
+        认领标记供外层包装函数在回复发送完毕后调用 stop_event()，
+        终止事件传播，防止陪伴/记忆类插件（private_companion、
+        self_learning、memory_companion 等）再次回复本指令并把
+        指令内容写入长期记忆。
+        """
+        event.should_call_llm(True)
+        event.set_extra("jmbot_claimed", True)
+
+    @filter.command("jm", priority=500000)
     async def cmd_jm(self, event: AstrMessageEvent, album_id: str = ""):
         """下载禁漫本子：/jm <id>，支持一条消息多个车号。"""
+        async for ret in self._cmd_jm_impl(event, album_id):
+            yield ret
+        # 所有回复均已通过管线发送完毕，此处终止事件传播是安全的
+        if event.get_extra("jmbot_claimed"):
+            event.stop_event()
+
+    async def _cmd_jm_impl(self, event: AstrMessageEvent, album_id: str = ""):
+        """下载禁漫本子：/jm <id>，支持一条消息多个车号。"""
         # 指令消息归 JMBot 处理：禁止 AstrBot 默认 LLM 再把指令当聊天回复一遍
-        event.should_call_llm(True)
+        self._claim(event)
         user_id = str(event.get_sender_id())
         is_group = not event.is_private_chat()
 
@@ -326,9 +346,17 @@ class JMBot(Star):
         yield event.plain_result("\n".join(lines))
 
     @filter.event_message_type(
-        filter.EventMessageType.GROUP_MESSAGE | filter.EventMessageType.PRIVATE_MESSAGE
+        filter.EventMessageType.GROUP_MESSAGE | filter.EventMessageType.PRIVATE_MESSAGE,
+        priority=500000,
     )
     async def on_jm_nospace(self, event: AstrMessageEvent):
+        """兜底：识别无空格写法 ``/jm350234``。"""
+        async for ret in self._on_jm_nospace_impl(event):
+            yield ret
+        if event.get_extra("jmbot_claimed"):
+            event.stop_event()
+
+    async def _on_jm_nospace_impl(self, event: AstrMessageEvent):
         """兜底：识别无空格写法 ``/jm350234``。
 
         标准指令过滤器只认 ``jm`` 后接空格/结尾，``jm350234``（群聊唤醒
@@ -340,7 +368,7 @@ class JMBot(Star):
             return
 
         # 命中 jm 车号形态，同样禁止默认 LLM 响应
-        event.should_call_llm(True)
+        self._claim(event)
 
         album_ids = self._parse_album_ids(text)
         if not album_ids:
@@ -380,8 +408,14 @@ class JMBot(Star):
     # 群聊超管命令（与 ncatbot 版一致：测试/开启/关闭）
     # ------------------------------------------------------------------
 
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=500000)
     async def on_group_admin(self, event: AstrMessageEvent):
+        async for ret in self._on_group_admin_impl(event):
+            yield ret
+        if event.get_extra("jmbot_claimed"):
+            event.stop_event()
+
+    async def _on_group_admin_impl(self, event: AstrMessageEvent):
         text = (event.message_str or "").strip()
         user_id = str(event.get_sender_id())
         if not self._check_admin(user_id):
@@ -389,7 +423,7 @@ class JMBot(Star):
 
         # 命中群聊管理命令时禁止默认 LLM 响应
         if text in ("测试JMBot", "关闭JMBot", "开启JMBot"):
-            event.should_call_llm(True)
+            self._claim(event)
 
         if text == "测试JMBot":
             yield event.plain_result("插件JMBot测试成功")
@@ -404,8 +438,14 @@ class JMBot(Star):
     # 私聊管理命令（仅超管）
     # ------------------------------------------------------------------
 
-    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
+    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE, priority=500000)
     async def on_private_message(self, event: AstrMessageEvent):
+        async for ret in self._on_private_message_impl(event):
+            yield ret
+        if event.get_extra("jmbot_claimed"):
+            event.stop_event()
+
+    async def _on_private_message_impl(self, event: AstrMessageEvent):
         text = event.message_str
         user_id = str(event.get_sender_id())
         logger.info(f"私聊消息: {text} (from {user_id})")
@@ -419,7 +459,7 @@ class JMBot(Star):
         if not self._check_admin(user_id):
             if user_id not in self._no_permission_notified:
                 self._no_permission_notified.add(user_id)
-                event.should_call_llm(True)
+                self._claim(event)
                 yield event.plain_result("你没有权限使用该命令，发送 /jm help 查看用法")
             return
 
@@ -428,15 +468,13 @@ class JMBot(Star):
 
         # 以 JM 开头或命中已知管理命令的消息一律认领：禁止默认 LLM 响应，
         # 即使命令拼写有误也由插件兜底提示，不落进 AI 聊天
-        claimed = False
         first_line = text.splitlines()[0].strip()
         if first_line.startswith("JM") or first_line.startswith(
             ("设置PDF密码", "设置下载路径", "设置JM账号", "设置JM密码")
         ) or first_line in (
             "打开加密", "关闭加密", "PDF密码", "下载路径",
         ):
-            event.should_call_llm(True)
-            claimed = True
+            self._claim(event)
 
         if text == "测试JMBot":
             yield event.plain_result("JMBot测试成功")
@@ -577,7 +615,7 @@ class JMBot(Star):
 
         # 兜底：认领了 JMBot 命令但未命中任何已知命令（如拼写有误），
         # 直接提示正确用法，不交给默认 LLM 回复
-        if claimed:
+        if event.get_extra("jmbot_claimed"):
             yield event.plain_result(
                 f"未知的 JMBot 命令：{first_line}\n发送 JM帮助 查看所有命令"
             )
