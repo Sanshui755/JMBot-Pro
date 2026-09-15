@@ -1,4 +1,4 @@
-"""
+﻿"""
 JMBot —— AstrBot 版禁漫下载插件
 
 群聊 / 私聊发送 ``/jm <id>``，机器人自动下载相册、生成 PDF 并发送文件。
@@ -134,7 +134,7 @@ class JMBot(Star):
         self._background_tasks.add(cleanup_task)
         cleanup_task.add_done_callback(self._background_tasks.discard)
 
-        logger.info("JMBot v1.3.2 已加载（指令消息已屏蔽默认 LLM 回复）")
+        logger.info("JMBot v1.3.3 已加载（指令消息已屏蔽默认 LLM 回复）")
         logger.info(f"JMBot 插件超管: {self.super_user or '(未配置)'}")
         logger.info(f"JMBot 下载目录: {self.download_root}")
 
@@ -412,15 +412,20 @@ class JMBot(Star):
                 yield event.plain_result("你没有权限使用该命令，发送 /jm help 查看用法")
             return
 
-        # 命中本插件管理命令的消息禁止默认 LLM 响应（普通聊天不受影响）
+        # 超管：归一化命令（JM 大小写、"登陆"错字），让下方分支稳定命中
+        text = re.sub(r"(?i)^jm", "JM", text.strip()).replace("登陆", "登录")
+
+        # 以 JM 开头或命中已知管理命令的消息一律认领：禁止默认 LLM 响应，
+        # 即使命令拼写有误也由插件兜底提示，不落进 AI 聊天
+        claimed = False
         first_line = text.splitlines()[0].strip()
-        if first_line in (
-            "测试JMBot", "打开加密", "关闭加密", "PDF密码", "下载路径",
-            "关闭JMBot", "开启JMBot", "JM帮助", "JM登录", "JM状态", "清除JM账号",
-        ) or first_line.startswith(
+        if first_line.startswith("JM") or first_line.startswith(
             ("设置PDF密码", "设置下载路径", "设置JM账号", "设置JM密码")
+        ) or first_line in (
+            "打开加密", "关闭加密", "PDF密码", "下载路径",
         ):
             event.should_call_llm(True)
+            claimed = True
 
         if text == "测试JMBot":
             yield event.plain_result("JMBot测试成功")
@@ -543,6 +548,13 @@ class JMBot(Star):
                 pass
             yield event.plain_result("已清除保存的 JM 账号密码")
             return
+
+        # 兜底：认领了 JMBot 命令但未命中任何已知命令（如拼写有误），
+        # 直接提示正确用法，不交给默认 LLM 回复
+        if claimed:
+            yield event.plain_result(
+                f"未知的 JMBot 命令：{first_line}\n发送 JM帮助 查看所有命令"
+            )
 
     def _check_admin(self, user_id: str) -> bool:
         """判断发送者是否为配置的超管。"""
