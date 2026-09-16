@@ -16,7 +16,8 @@
 ## 功能
 
 - `/jm <id>` — 下载指定本子并发送 PDF（群聊需先由超管开启，可批量）
-- `/jm -h <id>` 或 `/jm <id> -h` — 超分辨率下载（Real-ESRGAN anime 模型 4x 放大，首次使用自动下载约 45MB 工具包，无需 torch）
+- `/jm -h <id>` / `/jm -hr <id>` — 超分辨率下载（Real-ESRGAN anime 模型 4x 放大，首次自动下载约 45MB 工具包，无需 torch）
+- `/jm -hw <id>` — 超分辨率下载（waifu2x cunet 动漫模型，降噪级别 2，2x 放大，首次自动下载约 35MB 工具包）
 - `/jm help` — 查看用法
 - `/jms <关键词>` — 站内搜索本子（前 10 条结果：车号/标题/标签），兼容 `/jms关键词` 无空格写法
 - `/jma <作者名>` — 按作者搜索本子（前 10 条结果），兼容 `/jma作者名` 无空格写法
@@ -65,6 +66,8 @@
 
 - `jm_account.json` — JM 账号密码（明文，仅本机）
 - `config.yml` — jmcomic 下载配置（自动生成，路径已绝对化）
+- `realesrgan/` — Real-ESRGAN 超分工具（首次使用 `/jm -h`/`-hr` 时自动下载）
+- `waifu2x/` — waifu2x 超分工具（首次使用 `/jm -hw` 时自动下载）
 
 ## 依赖
 

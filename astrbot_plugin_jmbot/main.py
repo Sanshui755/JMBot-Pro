@@ -45,7 +45,8 @@ HELP_TEXT = (
     "例： /jm 350234\n"
     "支持批量： /jm 350234 350235（或一条消息里发多条 /jm 指令）\n"
     "数字后加中文备注也可以，如 /jm 350234极品\n"
-    "超分辨率下载（画质提升）：/jm -h 350234 或 /jm 350234 -h\n"
+    "超分辨率下载（画质提升）：/jm -h 350234 或 /jm 350234 -h（默认 Real-ESRGAN）\n"
+    "  /jm -hr 350234 用 Real-ESRGAN，/jm -hw 350234 用 waifu2x\n"
     "站内搜索：/jms <关键词>（如 /jms 全彩 人妻）\n"
     "按作者搜索：/jma <作者名>（如 /jma AREA188）\n"
     "只看详情不下载：/jmv 350234（可直接粘贴含车号的链接或整段文本）\n"
@@ -115,20 +116,43 @@ SEARCH_RESULTS_PER_PAGE = 10
 # 纯 jm 后必须跟 空格/数字/结尾
 SKIP_JM_PATTERN = r"/?jm(?:v(?=\s|\d|$)|[sa]|(?=\s|\d|$))"
 
-# ---------------- 超分辨率（Real-ESRGAN ncnn-vulkan）----------------
-REALESRGAN_DIR_NAME = "realesrgan"
-REALESRGAN_EXE_NAME = "realesrgan-ncnn-vulkan.exe"
-REALESRGAN_MODEL = "realesrgan-x4plus-anime"  # ncnn 内置动漫优化模型
-REALESRGAN_SCALE = 4
-REALESRGAN_FORMAT = "jpg"
-# Windows 二进制下载地址（v0.2.5.0 release, ~45MB）
-REALESRGAN_ZIP_URL = (
-    "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/"
-    "realesrgan-ncnn-vulkan-20220424-windows.zip"
-)
+# ---------------- 超分辨率（ncnn-vulkan 外部二进制，无需 torch）----------------
+# /jm -h 与 /jm -hr 默认走 Real-ESRGAN；/jm -hw 走 waifu2x。
+# 两套工具都是 ncnn-vulkan 预编译二进制，首次使用时按所选工具自动下载。
+# 注意两者命令行语义不同：
+#   Real-ESRGAN: -n <模型名> -s <放大倍数>
+#   waifu2x:      -n <降噪级别 0-3> -s <放大倍数>（模型由内置 models-cunet 提供）
+SUPERRES_FORMAT = "jpg"
+SUPERRES_TOOLS = {
+    "realesrgan": {
+        "dir": "realesrgan",
+        "exe": "realesrgan-ncnn-vulkan.exe",
+        "zip_url": (
+            "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/"
+            "realesrgan-ncnn-vulkan-20220424-windows.zip"
+        ),
+        "zip_name": "realesrgan-ncnn-vulkan.zip",
+        "label": "Real-ESRGAN",
+        "download_mb": "约 45MB",
+        "args": ["-n", "realesrgan-x4plus-anime", "-s", "4"],
+    },
+    "waifu2x": {
+        "dir": "waifu2x",
+        "exe": "waifu2x-ncnn-vulkan.exe",
+        "zip_url": (
+            "https://github.com/nihui/waifu2x-ncnn-vulkan/releases/download/"
+            "20250915/waifu2x-ncnn-vulkan-20250915-windows.zip"
+        ),
+        "zip_name": "waifu2x-ncnn-vulkan.zip",
+        "label": "waifu2x",
+        "download_mb": "约 35MB",
+        # -n 2 = 降噪级别 2（适合动漫），-s 2 = 2x 放大（waifu2x 最佳质量倍率）
+        "args": ["-n", "2", "-s", "2"],
+    },
+}
 
 
-@register("astrbot_plugin_jmbot", "Sanshui755", "禁漫下载插件，批量下载/搜索/超分辨率/路径可配/自动清理", "1.6.0", "")
+@register("astrbot_plugin_jmbot", "Sanshui755", "禁漫下载插件，批量下载/搜索/双模型超分辨率/路径可配/自动清理", "1.6.1", "")
 class JMBot(Star):
     """JMBot 插件"""
 
@@ -159,9 +183,13 @@ class JMBot(Star):
         # 已收到过"无权限"提示的私聊用户，每人只提示一次
         self._no_permission_notified: set[str] = set()
 
-        # 超分辨率二进制路径
-        self.realesrgan_dir = self.data_dir / REALESRGAN_DIR_NAME
-        self.realesrgan_exe = self.realesrgan_dir / REALESRGAN_EXE_NAME
+        # 超分辨率二进制路径（realesrgan / waifu2x 各自独立目录）
+        self.superres_dirs: dict[str, Path] = {}
+        self.superres_exes: dict[str, Path] = {}
+        for _model, _cfg in SUPERRES_TOOLS.items():
+            _dir = self.data_dir / _cfg["dir"]
+            self.superres_dirs[_model] = _dir
+            self.superres_exes[_model] = _dir / _cfg["exe"]
         # 超分辨率下载互斥锁（保护 img2pdf 插件临时禁用/恢复）
         self._super_res_lock = asyncio.Lock()
 
@@ -200,7 +228,7 @@ class JMBot(Star):
         self._background_tasks.add(cleanup_task)
         cleanup_task.add_done_callback(self._background_tasks.discard)
 
-        logger.info("JMBot v1.6.0 已加载（指令消息已隔离：屏蔽默认 LLM 与陪伴/记忆插件）")
+        logger.info("JMBot v1.6.1 已加载（指令消息已隔离：屏蔽默认 LLM 与陪伴/记忆插件）")
         logger.info(f"JMBot 插件超管: {self.super_user or '(未配置)'}")
         logger.info(f"JMBot 下载目录: {self.download_root}")
 
@@ -342,6 +370,26 @@ class JMBot(Star):
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _detect_super_res(text: str) -> tuple[str | None, str]:
+        """从命令文本检测超分辨率标志。
+
+        - ``/jm -hw <id>`` → ("waifu2x", 去掉标志后的文本)
+        - ``/jm -h <id>`` / ``/jm -hr <id>`` → ("realesrgan", 去掉标志后的文本)
+        - 无标志 → (None, 原文)
+
+        注意必须先判 ``-hw``：``-h`` 的正则不允许后跟 ``w``，所以
+        ``-hw`` 不会被误判为 Real-ESRGAN。
+        """
+        if re.search(r"(?:^|\s)-hw(?:\s|$)", text, re.IGNORECASE):
+            model = "waifu2x"
+        elif re.search(r"(?:^|\s)-h(?:r)?(?:\s|$)", text, re.IGNORECASE):
+            model = "realesrgan"
+        else:
+            return None, text
+        clean = re.sub(r"(?:^|\s)-h(?:r|w)?(?=\s|$)", "", text, flags=re.IGNORECASE)
+        return model, clean
+
+    @staticmethod
     def _claim(event: AstrMessageEvent) -> None:
         """JMBot 认领该消息：禁止默认 LLM 链路，并打上认领标记。
 
@@ -373,11 +421,9 @@ class JMBot(Star):
             # 群聊开关关闭：静默忽略，避免打扰群聊
             return
 
-        # 检测 -h 超分辨率标志
+        # 检测超分辨率标志：-h/-hr → realesrgan，-hw → waifu2x
         raw_text = event.message_str or ""
-        super_res = bool(re.search(r"(?:^|\s)-h(?:\s|$)", raw_text, re.IGNORECASE))
-        # 从文本中移除 -h，避免干扰车号解析
-        clean_text = re.sub(r"(?:^|\s)-h(?=\s|$)", "", raw_text, flags=re.IGNORECASE)
+        super_model, clean_text = self._detect_super_res(raw_text)
 
         # 从消息原文解析全部车号（/jm a b、多条 /jm、数字后带中文备注均支持）
         album_ids = self._parse_album_ids(clean_text)
@@ -387,7 +433,11 @@ class JMBot(Star):
 
         total = len(album_ids)
         id_preview = "、".join(album_ids)
-        mode_hint = "（超分辨率模式，速度较慢）" if super_res else ""
+        if super_model:
+            mode_label = SUPERRES_TOOLS[super_model]["label"]
+            mode_hint = f"（{mode_label} 超分辨率模式，速度较慢）"
+        else:
+            mode_hint = ""
         yield event.plain_result(f"开始下载 {total} 个本子{mode_hint}：{id_preview}，请稍候……")
 
         succeeded: list[str] = []
@@ -395,7 +445,7 @@ class JMBot(Star):
 
         for aid in album_ids:
             try:
-                file_path = await self._fetch_pdf(aid, super_res=super_res)
+                file_path = await self._fetch_pdf(aid, super_model=super_model)
                 # 群聊按配置加密；私聊不加密
                 if is_group and self.pdf_encrypt:
                     file_path = await self._encrypt_pdf(aid, file_path)
@@ -553,11 +603,11 @@ class JMBot(Star):
                 yield ret
             return
 
-        # /jm350234：下载（检测 -h 标志）
-        # 先移除 -h 再匹配数字模式
+        # /jm350234：下载（检测 -h/-hr/-hw 超分辨率标志）
+        # 先去掉超分标志再匹配数字模式
         raw_text = event.message_str or ""
-        super_res = bool(re.search(r"(?:^|\s)-h(?:\s|$)", raw_text, re.IGNORECASE))
-        clean_text = re.sub(r"(?:^|\s)-h(?=\s|$)", "", raw_text, flags=re.IGNORECASE).strip()
+        super_model, clean_text = self._detect_super_res(raw_text)
+        clean_text = clean_text.strip()
 
         if not re.match(r"/?jm\d+", clean_text, re.IGNORECASE):
             return
@@ -575,14 +625,18 @@ class JMBot(Star):
 
         total = len(album_ids)
         id_preview = "、".join(album_ids)
-        mode_hint = "（超分辨率模式，速度较慢）" if super_res else ""
+        if super_model:
+            mode_label = SUPERRES_TOOLS[super_model]["label"]
+            mode_hint = f"（{mode_label} 超分辨率模式，速度较慢）"
+        else:
+            mode_hint = ""
         yield event.plain_result(f"开始下载 {total} 个本子{mode_hint}：{id_preview}，请稍候……")
 
         succeeded: list[str] = []
         failed: list[tuple[str, str]] = []
         for aid in album_ids:
             try:
-                file_path = await self._fetch_pdf(aid, super_res=super_res)
+                file_path = await self._fetch_pdf(aid, super_model=super_model)
                 if is_group and self.pdf_encrypt:
                     file_path = await self._encrypt_pdf(aid, file_path)
                 yield event.chain_result([File(file=file_path, name=f"{aid}.pdf")])
@@ -1054,14 +1108,16 @@ class JMBot(Star):
         lines.append(f"需要下载请发送：/jm {detail.album_id}")
         return "\n".join(lines)
 
-    async def _fetch_pdf(self, album_id: str, super_res: bool = False) -> str:
+    async def _fetch_pdf(self, album_id: str, super_model: str | None = None) -> str:
         """下载相册并生成 PDF，返回 PDF 绝对路径。
 
-        super_res=True 时：禁用 img2pdf 插件 → 下载原图 → realesrgan 超分辨率 → 手动 img2pdf。
+        super_model 为 None 时走普通下载（jmcomic 的 img2pdf 插件自动合并）；
+        为 ``"realesrgan"`` 或 ``"waifu2x"`` 时：禁用 img2pdf 插件 → 下载原图 →
+        对应工具超分辨率 → 手动 img2pdf。
         """
         await self._ensure_jm_login()
 
-        if not super_res:
+        if not super_model:
             def _download() -> None:
                 self.jm_option.download_album([album_id])
 
@@ -1071,15 +1127,18 @@ class JMBot(Star):
                 raise FileNotFoundError(f"未找到生成的 PDF: {pdf_path}")
             return str(pdf_path.resolve())
 
-        return await self._fetch_pdf_super_res(album_id)
+        return await self._fetch_pdf_super_res(album_id, super_model)
 
-    async def _fetch_pdf_super_res(self, album_id: str) -> str:
-        """超分辨率下载：下载原图 → realesrgan → 手动 img2pdf 生成 PDF。"""
+    async def _fetch_pdf_super_res(self, album_id: str, model: str) -> str:
+        """超分辨率下载：下载原图 → ncnn-vulkan 工具放大 → 手动 img2pdf 生成 PDF。"""
+        cfg = SUPERRES_TOOLS[model]
+        label = cfg["label"]
+
         # Step 1: 确保二进制就绪
-        exe_path = await self._ensure_realesrgan_binary()
+        exe_path = await self._ensure_superres_binary(model)
         if exe_path is None:
-            logger.warning("realesrgan 二进制不可用，回退到普通下载")
-            return await self._fetch_pdf(album_id, super_res=False)
+            logger.warning(f"{label} 二进制不可用，回退到普通下载")
+            return await self._fetch_pdf(album_id, super_model=None)
 
         async with self._super_res_lock:
             # Step 2: 临时禁用 img2pdf 插件，下载原图
@@ -1104,27 +1163,25 @@ class JMBot(Star):
             if not image_paths:
                 raise FileNotFoundError(f"下载完成但未找到图片文件: {album_id}")
 
-            # Step 3: 运行 realesrgan 超分辨率处理（按 photo 目录分组）
-            from pathlib import Path as _Path
-
-            input_dirs = sorted(set(_Path(p).parent for p in image_paths))
+            # Step 3: 运行超分工具（按 photo 目录分组）
+            input_dirs = sorted(set(Path(p).parent for p in image_paths))
             hr_image_paths: list[str] = []
 
             for img_dir in input_dirs:
-                hr_dir = img_dir.parent / (img_dir.name + "_hr")
+                # 目录名带上模型后缀，避免两套工具的输出互相覆盖
+                hr_dir = img_dir.parent / f"{img_dir.name}_hr_{model}"
                 hr_dir.mkdir(parents=True, exist_ok=True)
 
                 cmd = [
                     str(exe_path),
                     "-i", str(img_dir),
                     "-o", str(hr_dir),
-                    "-n", REALESRGAN_MODEL,
-                    "-s", str(REALESRGAN_SCALE),
-                    "-f", REALESRGAN_FORMAT,
+                    *cfg["args"],
+                    "-f", SUPERRES_FORMAT,
                 ]
-                logger.info(f"realesrgan 处理目录: {img_dir} -> {hr_dir}")
+                logger.info(f"{label} 处理目录: {img_dir} -> {hr_dir}")
 
-                def _run_binary(cmd=cmd):
+                def _run_binary(cmd=cmd, label=label):
                     import subprocess
                     proc = subprocess.run(
                         cmd,
@@ -1134,7 +1191,7 @@ class JMBot(Star):
                     )
                     if proc.returncode != 0:
                         raise RuntimeError(
-                            f"realesrgan 执行失败(returncode={proc.returncode}): "
+                            f"{label} 执行失败(returncode={proc.returncode}): "
                             f"{proc.stderr[:500] if proc.stderr else '无错误输出'}"
                         )
                     return proc
@@ -1142,13 +1199,14 @@ class JMBot(Star):
                 try:
                     await asyncio.to_thread(_run_binary)
                 except Exception as e:
-                    logger.exception(f"realesrgan 处理 {img_dir} 失败: {e}")
+                    logger.exception(f"{label} 处理 {img_dir} 失败: {e}")
+                    # 该章超分失败：回退使用原图，保证整本能正常出 PDF
                     hr_image_paths.extend(
-                        str(p) for p in image_paths if _Path(p).parent == img_dir
+                        str(p) for p in image_paths if Path(p).parent == img_dir
                     )
                     continue
 
-                hr_images = sorted(hr_dir.glob("*.jpg"))
+                hr_images = sorted(hr_dir.glob(f"*.{SUPERRES_FORMAT}"))
                 hr_image_paths.extend(str(p) for p in hr_images)
 
             if not hr_image_paths:
@@ -1169,30 +1227,37 @@ class JMBot(Star):
                 raise FileNotFoundError(f"超分辨率 PDF 生成失败: {pdf_path}")
             return str(pdf_path.resolve())
 
-    async def _ensure_realesrgan_binary(self):
-        """确保 realesrgan 二进制存在，不存在则自动下载解压。
+    async def _ensure_superres_binary(self, model: str):
+        """确保指定超分工具的二进制存在，不存在则自动下载解压。
 
         返回 exe 的 Path，失败返回 None。
         """
-        if self.realesrgan_exe.exists():
-            return self.realesrgan_exe
+        cfg = SUPERRES_TOOLS[model]
+        label = cfg["label"]
+        tool_dir = self.superres_dirs[model]
+        exe_path = self.superres_exes[model]
 
-        self.realesrgan_dir.mkdir(parents=True, exist_ok=True)
-        zip_path = self.realesrgan_dir / "realesrgan-ncnn-vulkan.zip"
+        if exe_path.exists():
+            return exe_path
+
+        tool_dir.mkdir(parents=True, exist_ok=True)
+        zip_path = tool_dir / cfg["zip_name"]
 
         try:
-            logger.info(f"开始下载 realesrgan 二进制（约 45MB）: {REALESRGAN_ZIP_URL}")
+            logger.info(
+                f"开始下载 {label} 二进制（{cfg['download_mb']}）: {cfg['zip_url']}"
+            )
 
             def _download_zip():
                 import urllib.request
-                urllib.request.urlretrieve(REALESRGAN_ZIP_URL, str(zip_path))
+                urllib.request.urlretrieve(cfg["zip_url"], str(zip_path))
 
             await asyncio.to_thread(_download_zip)
 
             def _extract_zip():
                 import zipfile
                 with zipfile.ZipFile(str(zip_path), "r") as zf:
-                    zf.extractall(str(self.realesrgan_dir))
+                    zf.extractall(str(tool_dir))
 
             await asyncio.to_thread(_extract_zip)
 
@@ -1201,19 +1266,20 @@ class JMBot(Star):
             except OSError:
                 pass
 
-            if self.realesrgan_exe.exists():
-                logger.info(f"realesrgan 二进制已就绪: {self.realesrgan_exe}")
-                return self.realesrgan_exe
+            if exe_path.exists():
+                logger.info(f"{label} 二进制已就绪: {exe_path}")
+                return exe_path
 
-            for exe in self.realesrgan_dir.rglob(REALESRGAN_EXE_NAME):
-                logger.info(f"realesrgan 二进制找到于: {exe}")
+            # 部分压缩包会多套一层目录，递归查找
+            for exe in tool_dir.rglob(cfg["exe"]):
+                logger.info(f"{label} 二进制找到于: {exe}")
                 return exe
 
-            logger.error(f"realesrgan 二进制解压后未找到: {self.realesrgan_dir}")
+            logger.error(f"{label} 二进制解压后未找到: {tool_dir}")
             return None
 
         except Exception as e:
-            logger.exception(f"realesrgan 二进制下载/解压失败: {e}")
+            logger.exception(f"{label} 二进制下载/解压失败: {e}")
             return None
 
     async def _encrypt_pdf(self, album_id: str, src_pdf: str) -> str:
