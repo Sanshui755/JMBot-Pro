@@ -80,7 +80,7 @@ DEFAULT_DOWNLOAD_ROOT = str(Path.home() / "JMBot-Downloads")
 LEGACY_DOWNLOAD_ROOTS: tuple[str, ...] = ()
 
 
-@register("astrbot_plugin_jmbot", "Sanshui755", "禁漫下载插件，批量下载/路径可配/自动清理", "1.3.6", "")
+@register("astrbot_plugin_jmbot", "Sanshui755", "禁漫下载插件，批量下载/路径可配/自动清理", "1.4.0", "")
 class JMBot(Star):
     """JMBot 插件"""
 
@@ -124,18 +124,29 @@ class JMBot(Star):
         if not self.super_user:
             logger.warning("未配置超管 QQ，请在 AstrBot 管理面板的 JMBot 插件配置中填写")
 
-        # 已保存 JM 账号则后台自动登录；不阻塞插件加载
+        # 已保存 JM 账号则后台自动登录；不阻塞插件加载。
+        # WebUI 配置页保存后会热重载插件，重载即触发这里的自动登录——
+        # 相当于每次保存配置都做一次登录测试，结果见下方日志（成功/失败均打印）。
         if self.jm_username and self.jm_password:
+            logger.info(
+                f"检测到已配置 JM 账号({self.jm_cred_source})，开始后台自动登录测试"
+            )
             task = asyncio.create_task(self._jm_login())
             self._background_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
+        else:
+            logger.warning(
+                "尚未配置 JM 账号：请在 WebUI 插件配置页填写 JM 账号/密码并保存，"
+                "保存后插件会自动重载并尝试登录（结果见日志）；也可由超管私聊机器人发送 "
+                "设置JM账号 / 设置JM密码"
+            )
 
         # 启动下载产物自动清理任务（先清理一次，之后每隔 6 小时清理）
         cleanup_task = asyncio.create_task(self._cleanup_loop())
         self._background_tasks.add(cleanup_task)
         cleanup_task.add_done_callback(self._background_tasks.discard)
 
-        logger.info("JMBot v1.3.6 已加载（指令消息已隔离：屏蔽默认 LLM 与陪伴/记忆插件）")
+        logger.info("JMBot v1.4.0 已加载（指令消息已隔离：屏蔽默认 LLM 与陪伴/记忆插件）")
         logger.info(f"JMBot 插件超管: {self.super_user or '(未配置)'}")
         logger.info(f"JMBot 下载目录: {self.download_root}")
 
