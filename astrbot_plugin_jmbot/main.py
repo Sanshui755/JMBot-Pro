@@ -45,6 +45,9 @@ HELP_TEXT = (
     "例： /jm 350234\n"
     "支持批量： /jm 350234 350235（或一条消息里发多条 /jm 指令）\n"
     "数字后加中文备注也可以，如 /jm 350234极品\n"
+    "超分辨率下载（画质提升）：/jm -h 350234 或 /jm 350234 -h\n"
+    "站内搜索：/jms <关键词>（如 /jms 全彩 人妻）\n"
+    "按作者搜索：/jma <作者名>（如 /jma AREA188）\n"
     "只看详情不下载：/jmv 350234（可直接粘贴含车号的链接或整段文本）\n"
     "下载的文件仅在本机保留3天，到期自动删除\n"
     "如有pdf有密码,默认密码为114514"
@@ -56,6 +59,20 @@ JMV_HELP_TEXT = (
     "例： /jmv 350234\n"
     "也可直接粘贴链接或整段文本，如：/jmv https://18comic.vip/album/350234/\n"
     "需要下载请发送 /jm 350234"
+)
+
+JMS_HELP_TEXT = (
+    "站内搜索：/jms <关键词>\n"
+    "例：/jms 全彩 人妻\n"
+    "支持无空格写法：/jms全彩\n"
+    "搜索结果默认显示前 10 条，需要下载请发送 /jm <id>"
+)
+
+JMA_HELP_TEXT = (
+    "按作者搜索：/jma <作者名>\n"
+    "例：/jma AREA188\n"
+    "支持无空格写法：/jmaAREA188\n"
+    "搜索结果默认显示前 10 条，需要下载请发送 /jm <id>"
 )
 
 ADMIN_HELP_TEXT = (
@@ -90,8 +107,28 @@ DEFAULT_DOWNLOAD_ROOT = str(Path.home() / "JMBot-Downloads")
 # 历史版本使用过的下载根目录（如需从旧目录自动迁移，把旧目录填到这里即可）
 LEGACY_DOWNLOAD_ROOTS: tuple[str, ...] = ()
 
+# ---------------- 搜索 ----------------
+SEARCH_RESULTS_PER_PAGE = 10
+# 私聊跳过正则：覆盖 jm/jmv/jms/jma 所有形态
+# v 后必须跟 空格/数字/结尾（不匹配 /jmversion）
+# s/a 后跟任意非空字符（关键词可任意开头）
+# 纯 jm 后必须跟 空格/数字/结尾
+SKIP_JM_PATTERN = r"/?jm(?:v(?=\s|\d|$)|[sa]|(?=\s|\d|$))"
 
-@register("astrbot_plugin_jmbot", "Sanshui755", "禁漫下载插件，批量下载/路径可配/自动清理", "1.5.0", "")
+# ---------------- 超分辨率（Real-ESRGAN ncnn-vulkan）----------------
+REALESRGAN_DIR_NAME = "realesrgan"
+REALESRGAN_EXE_NAME = "realesrgan-ncnn-vulkan.exe"
+REALESRGAN_MODEL = "realesrgan-x4plus-anime"  # ncnn 内置动漫优化模型
+REALESRGAN_SCALE = 4
+REALESRGAN_FORMAT = "jpg"
+# Windows 二进制下载地址（v0.2.5.0 release, ~45MB）
+REALESRGAN_ZIP_URL = (
+    "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/"
+    "realesrgan-ncnn-vulkan-20220424-windows.zip"
+)
+
+
+@register("astrbot_plugin_jmbot", "Sanshui755", "禁漫下载插件，批量下载/搜索/超分辨率/路径可配/自动清理", "1.6.0", "")
 class JMBot(Star):
     """JMBot 插件"""
 
@@ -121,6 +158,12 @@ class JMBot(Star):
         self._background_tasks: set = set()
         # 已收到过"无权限"提示的私聊用户，每人只提示一次
         self._no_permission_notified: set[str] = set()
+
+        # 超分辨率二进制路径
+        self.realesrgan_dir = self.data_dir / REALESRGAN_DIR_NAME
+        self.realesrgan_exe = self.realesrgan_dir / REALESRGAN_EXE_NAME
+        # 超分辨率下载互斥锁（保护 img2pdf 插件临时禁用/恢复）
+        self._super_res_lock = asyncio.Lock()
 
         # 后台把历史下载目录（旧版本布局）迁到当前路径
         self._migration_task = asyncio.create_task(
@@ -157,7 +200,7 @@ class JMBot(Star):
         self._background_tasks.add(cleanup_task)
         cleanup_task.add_done_callback(self._background_tasks.discard)
 
-        logger.info("JMBot v1.5.0 已加载（指令消息已隔离：屏蔽默认 LLM 与陪伴/记忆插件）")
+        logger.info("JMBot v1.6.0 已加载（指令消息已隔离：屏蔽默认 LLM 与陪伴/记忆插件）")
         logger.info(f"JMBot 插件超管: {self.super_user or '(未配置)'}")
         logger.info(f"JMBot 下载目录: {self.download_root}")
 
@@ -330,22 +373,29 @@ class JMBot(Star):
             # 群聊开关关闭：静默忽略，避免打扰群聊
             return
 
+        # 检测 -h 超分辨率标志
+        raw_text = event.message_str or ""
+        super_res = bool(re.search(r"(?:^|\s)-h(?:\s|$)", raw_text, re.IGNORECASE))
+        # 从文本中移除 -h，避免干扰车号解析
+        clean_text = re.sub(r"(?:^|\s)-h(?=\s|$)", "", raw_text, flags=re.IGNORECASE)
+
         # 从消息原文解析全部车号（/jm a b、多条 /jm、数字后带中文备注均支持）
-        album_ids = self._parse_album_ids(event.message_str)
+        album_ids = self._parse_album_ids(clean_text)
         if not album_ids:
             yield event.plain_result(HELP_TEXT)
             return
 
         total = len(album_ids)
         id_preview = "、".join(album_ids)
-        yield event.plain_result(f"开始下载 {total} 个本子：{id_preview}，请稍候……")
+        mode_hint = "（超分辨率模式，速度较慢）" if super_res else ""
+        yield event.plain_result(f"开始下载 {total} 个本子{mode_hint}：{id_preview}，请稍候……")
 
         succeeded: list[str] = []
         failed: list[tuple[str, str]] = []
 
         for aid in album_ids:
             try:
-                file_path = await self._fetch_pdf(aid)
+                file_path = await self._fetch_pdf(aid, super_res=super_res)
                 # 群聊按配置加密；私聊不加密
                 if is_group and self.pdf_encrypt:
                     file_path = await self._encrypt_pdf(aid, file_path)
@@ -402,6 +452,66 @@ class JMBot(Star):
             logger.exception(f"/jmv 查询本子 {album_id} 详情失败: {e}")
             yield event.plain_result(self._format_view_error(album_id, e))
 
+    # ------------------------------------------------------------------
+    # /jms 站内搜索 & /jma 作者搜索（不下载，群聊/私聊均可触发）
+    # ------------------------------------------------------------------
+
+    @filter.command("jms", priority=500000)
+    async def cmd_jms(self, event: AstrMessageEvent, keyword: str = ""):
+        """站内搜索本子：/jms <关键词>"""
+        async for ret in self._jms_impl(event, keyword):
+            yield ret
+        if event.get_extra("jmbot_claimed"):
+            event.stop_event()
+
+    @filter.command("jma", priority=500000)
+    async def cmd_jma(self, event: AstrMessageEvent, keyword: str = ""):
+        """按作者搜索本子：/jma <作者名>"""
+        async for ret in self._jma_impl(event, keyword):
+            yield ret
+        if event.get_extra("jmbot_claimed"):
+            event.stop_event()
+
+    async def _jms_impl(self, event: AstrMessageEvent, keyword: str):
+        """站内搜索流程，供标准指令与无空格兜底共用。"""
+        self._claim(event)
+        is_group = not event.is_private_chat()
+        if is_group and not self.jm_on:
+            return
+
+        keyword = keyword.strip()
+        if not keyword:
+            yield event.plain_result(JMS_HELP_TEXT)
+            return
+
+        yield event.plain_result(f"正在搜索「{keyword}」……")
+        try:
+            page = await self._fetch_search_page(keyword, search_type="site")
+            yield event.plain_result(self._format_search_results(keyword, page))
+        except Exception as e:
+            logger.exception(f"/jms 搜索「{keyword}」失败: {e}")
+            yield event.plain_result(f"搜索失败：{e}")
+
+    async def _jma_impl(self, event: AstrMessageEvent, keyword: str):
+        """按作者搜索流程，供标准指令与无空格兜底共用。"""
+        self._claim(event)
+        is_group = not event.is_private_chat()
+        if is_group and not self.jm_on:
+            return
+
+        keyword = keyword.strip()
+        if not keyword:
+            yield event.plain_result(JMA_HELP_TEXT)
+            return
+
+        yield event.plain_result(f"正在搜索作者「{keyword}」……")
+        try:
+            page = await self._fetch_search_page(keyword, search_type="author")
+            yield event.plain_result(self._format_search_results(keyword, page, is_author=True))
+        except Exception as e:
+            logger.exception(f"/jma 搜索作者「{keyword}」失败: {e}")
+            yield event.plain_result(f"搜索失败：{e}")
+
     @filter.event_message_type(
         filter.EventMessageType.GROUP_MESSAGE | filter.EventMessageType.PRIVATE_MESSAGE,
         priority=500000,
@@ -414,28 +524,48 @@ class JMBot(Star):
             event.stop_event()
 
     async def _on_jm_nospace_impl(self, event: AstrMessageEvent):
-        """兜底：识别无空格写法 ``/jm350234`` / ``/jmv350234``。
+        """兜底：识别无空格写法 ``/jm350234`` / ``/jmv350234`` / ``/jms关键词`` / ``/jma作者名``。
 
-        标准指令过滤器只认 ``jm``/``jmv`` 后接空格/结尾，``jm350234``
-        （群聊唤醒前缀 ``/`` 被剥掉）或私聊原文 ``/jm350234`` 都不会命中
-        指令处理器，这里统一接住并解析。``v`` 后必须紧跟数字才按详情查询
-        处理，避免误吞 /jmversion 之类的普通单词。
+        标准指令过滤器只认 ``jm``/``jmv``/``jms``/``/jma`` 后接空格/结尾，
+        无空格写法不会命中指令处理器，这里统一接住并解析。
+        ``v`` 后必须紧跟数字才按详情查询处理，避免误吞 /jmversion。
+        ``s``/``a`` 后紧跟任意非空字符即按搜索处理。
         """
         text = (event.message_str or "").strip()
 
-        # /jmv350234：直接走详情查询流程（与 /jm\d+ 互斥，不会同时命中）
+        # /jmv350234：详情查询（v 后必须紧跟数字）
         if re.match(r"/?jmv(?=\d)", text, re.IGNORECASE):
             async for ret in self._jmv_impl(event, text):
                 yield ret
             return
 
-        if not re.match(r"/?jm\d+", text, re.IGNORECASE):
+        # /jms关键词：站内搜索（s 后紧跟任意非空字符）
+        if re.match(r"/?jms(?=\S)", text, re.IGNORECASE):
+            keyword = re.sub(r"^/?jms\s*", "", text, count=1, flags=re.IGNORECASE).strip()
+            async for ret in self._jms_impl(event, keyword):
+                yield ret
+            return
+
+        # /jma作者名：作者搜索（a 后紧跟任意非空字符）
+        if re.match(r"/?jma(?=\S)", text, re.IGNORECASE):
+            keyword = re.sub(r"^/?jma\s*", "", text, count=1, flags=re.IGNORECASE).strip()
+            async for ret in self._jma_impl(event, keyword):
+                yield ret
+            return
+
+        # /jm350234：下载（检测 -h 标志）
+        # 先移除 -h 再匹配数字模式
+        raw_text = event.message_str or ""
+        super_res = bool(re.search(r"(?:^|\s)-h(?:\s|$)", raw_text, re.IGNORECASE))
+        clean_text = re.sub(r"(?:^|\s)-h(?=\s|$)", "", raw_text, flags=re.IGNORECASE).strip()
+
+        if not re.match(r"/?jm\d+", clean_text, re.IGNORECASE):
             return
 
         # 命中 jm 车号形态，同样禁止默认 LLM 响应
         self._claim(event)
 
-        album_ids = self._parse_album_ids(text)
+        album_ids = self._parse_album_ids(clean_text)
         if not album_ids:
             return
 
@@ -445,13 +575,14 @@ class JMBot(Star):
 
         total = len(album_ids)
         id_preview = "、".join(album_ids)
-        yield event.plain_result(f"开始下载 {total} 个本子：{id_preview}，请稍候……")
+        mode_hint = "（超分辨率模式，速度较慢）" if super_res else ""
+        yield event.plain_result(f"开始下载 {total} 个本子{mode_hint}：{id_preview}，请稍候……")
 
         succeeded: list[str] = []
         failed: list[tuple[str, str]] = []
         for aid in album_ids:
             try:
-                file_path = await self._fetch_pdf(aid)
+                file_path = await self._fetch_pdf(aid, super_res=super_res)
                 if is_group and self.pdf_encrypt:
                     file_path = await self._encrypt_pdf(aid, file_path)
                 yield event.chain_result([File(file=file_path, name=f"{aid}.pdf")])
@@ -515,10 +646,11 @@ class JMBot(Star):
         user_id = str(event.get_sender_id())
         logger.info(f"私聊消息: {text} (from {user_id})")
 
-        # /jm、/jmv 指令交给指令处理器与无空格兜底处理器，这里不重复处理
-        # （/jm、/jm 350234、/jm350234、/jmv 350234、/jmv350234 均跳过；
+        # /jm、/jmv、/jms、/jma 指令交给指令处理器与无空格兜底处理器，这里不重复处理
+        # （/jm 350234、/jm350234、/jmv 350234、/jmv350234、
+        #   /jms 关键词、/jms关键词、/jma 作者、/jma作者 均跳过；
         # JM状态/JM帮助 等中文命令不受影响）
-        if re.match(r"/?jmv?(?:\s|\d|$)", text, re.IGNORECASE):
+        if re.match(SKIP_JM_PATTERN, text, re.IGNORECASE):
             return
 
         # 以下管理命令仅超管可用：非超管对任何其他消息只提示一次，避免刷屏
@@ -773,14 +905,12 @@ class JMBot(Star):
         await self._ensure_jm_login()
 
         async def _query_html():
-            """用网页端客户端查询，15 秒超时防卡死。"""
             def _do():
                 client = self.jm_option.new_jm_client(impl="html")
                 return client.get_album_detail(album_id)
             return await asyncio.to_thread(_do)
 
         def _query_api():
-            """用移动端 API 客户端查询（回退方案）。"""
             client = self.jm_option.build_jm_client()
             return client.get_album_detail(album_id)
 
@@ -791,6 +921,67 @@ class JMBot(Star):
         except Exception as e:
             logger.info(f"/jmv HTML 客户端失败({e})，回退到 API 客户端: {album_id}")
         return await asyncio.to_thread(_query_api)
+
+    async def _fetch_search_page(self, query: str, search_type: str = "site"):
+        """调用 JM 搜索 API，返回 JmSearchPage。
+
+        优先使用网页端客户端（标签更完整），20 秒超时后回退移动端 API。
+        search_type: "site" → search_site, "author" → search_author
+        """
+        await self._ensure_jm_login()
+
+        def _search_html():
+            client = self.jm_option.new_jm_client(impl="html")
+            if search_type == "author":
+                return client.search_author(query, page=1)
+            return client.search_site(query, page=1)
+
+        def _search_api():
+            client = self.jm_option.build_jm_client()
+            if search_type == "author":
+                return client.search_author(query, page=1)
+            return client.search_site(query, page=1)
+
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(_search_html), timeout=20
+            )
+        except asyncio.TimeoutError:
+            logger.info(f"搜索 HTML 客户端超时，回退到 API: {query}")
+        except Exception as e:
+            logger.info(f"搜索 HTML 客户端失败({e})，回退到 API: {query}")
+        return await asyncio.to_thread(_search_api)
+
+    @staticmethod
+    def _format_search_results(query: str, page, is_author: bool = False) -> str:
+        """把 JmSearchPage 渲染为搜索结果文本（前 10 条）。"""
+        search_label = "作者" if is_author else "站内"
+        total = getattr(page, "total", 0) or 0
+        results = list(page.iter_id_title_tag())
+
+        if not results:
+            return f"{search_label}搜索「{query}」无结果"
+
+        results = results[:SEARCH_RESULTS_PER_PAGE]
+
+        lines = [
+            f"{search_label}搜索「{query}」的结果"
+            f"（共 {total} 个，显示前 {len(results)} 个）："
+        ]
+        for i, (aid, title, tags) in enumerate(results, 1):
+            title_short = (title or "(无标题)")[:40]
+            tag_text = ""
+            if tags:
+                tag_list = [str(t) for t in tags[:5]]
+                tag_text = "、".join(tag_list)
+                if len(tag_text) > 30:
+                    tag_text = tag_text[:30] + "…"
+            lines.append(f"{i}. [{aid}] {title_short}")
+            if tag_text:
+                lines.append(f"   标签：{tag_text}")
+
+        lines.append(f"需要下载请发送：/jm <id>（超分辨率下载：/jm -h <id>）")
+        return "\n".join(lines)
 
     @staticmethod
     def _format_album_detail(detail) -> str:
@@ -863,18 +1054,167 @@ class JMBot(Star):
         lines.append(f"需要下载请发送：/jm {detail.album_id}")
         return "\n".join(lines)
 
-    async def _fetch_pdf(self, album_id: str) -> str:
-        """下载相册并生成 PDF，返回 PDF 绝对路径。"""
+    async def _fetch_pdf(self, album_id: str, super_res: bool = False) -> str:
+        """下载相册并生成 PDF，返回 PDF 绝对路径。
+
+        super_res=True 时：禁用 img2pdf 插件 → 下载原图 → realesrgan 超分辨率 → 手动 img2pdf。
+        """
         await self._ensure_jm_login()
 
-        def _download() -> None:
-            self.jm_option.download_album([album_id])
+        if not super_res:
+            def _download() -> None:
+                self.jm_option.download_album([album_id])
 
-        await asyncio.to_thread(_download)
-        pdf_path = self.download_root / "pdf" / f"{album_id}.pdf"
-        if not pdf_path.exists():
-            raise FileNotFoundError(f"未找到生成的 PDF: {pdf_path}")
-        return str(pdf_path.resolve())
+            await asyncio.to_thread(_download)
+            pdf_path = self.download_root / "pdf" / f"{album_id}.pdf"
+            if not pdf_path.exists():
+                raise FileNotFoundError(f"未找到生成的 PDF: {pdf_path}")
+            return str(pdf_path.resolve())
+
+        return await self._fetch_pdf_super_res(album_id)
+
+    async def _fetch_pdf_super_res(self, album_id: str) -> str:
+        """超分辨率下载：下载原图 → realesrgan → 手动 img2pdf 生成 PDF。"""
+        # Step 1: 确保二进制就绪
+        exe_path = await self._ensure_realesrgan_binary()
+        if exe_path is None:
+            logger.warning("realesrgan 二进制不可用，回退到普通下载")
+            return await self._fetch_pdf(album_id, super_res=False)
+
+        async with self._super_res_lock:
+            # Step 2: 临时禁用 img2pdf 插件，下载原图
+            original_after_album = self.jm_option.plugins.src_dict.get(
+                "after_album", []
+            )
+            image_paths: list[str] = []
+            try:
+                self.jm_option.plugins.src_dict["after_album"] = []
+
+                def _download():
+                    return self.jm_option.download_album(album_id)
+
+                result = await asyncio.to_thread(_download)
+                image_paths = list(result.manifest.image_filepath_list)
+            except Exception as e:
+                logger.exception(f"超分辨率下载：下载原图失败 {album_id}: {e}")
+                raise
+            finally:
+                self.jm_option.plugins.src_dict["after_album"] = original_after_album
+
+            if not image_paths:
+                raise FileNotFoundError(f"下载完成但未找到图片文件: {album_id}")
+
+            # Step 3: 运行 realesrgan 超分辨率处理（按 photo 目录分组）
+            from pathlib import Path as _Path
+
+            input_dirs = sorted(set(_Path(p).parent for p in image_paths))
+            hr_image_paths: list[str] = []
+
+            for img_dir in input_dirs:
+                hr_dir = img_dir.parent / (img_dir.name + "_hr")
+                hr_dir.mkdir(parents=True, exist_ok=True)
+
+                cmd = [
+                    str(exe_path),
+                    "-i", str(img_dir),
+                    "-o", str(hr_dir),
+                    "-n", REALESRGAN_MODEL,
+                    "-s", str(REALESRGAN_SCALE),
+                    "-f", REALESRGAN_FORMAT,
+                ]
+                logger.info(f"realesrgan 处理目录: {img_dir} -> {hr_dir}")
+
+                def _run_binary(cmd=cmd):
+                    import subprocess
+                    proc = subprocess.run(
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=600,
+                    )
+                    if proc.returncode != 0:
+                        raise RuntimeError(
+                            f"realesrgan 执行失败(returncode={proc.returncode}): "
+                            f"{proc.stderr[:500] if proc.stderr else '无错误输出'}"
+                        )
+                    return proc
+
+                try:
+                    await asyncio.to_thread(_run_binary)
+                except Exception as e:
+                    logger.exception(f"realesrgan 处理 {img_dir} 失败: {e}")
+                    hr_image_paths.extend(
+                        str(p) for p in image_paths if _Path(p).parent == img_dir
+                    )
+                    continue
+
+                hr_images = sorted(hr_dir.glob("*.jpg"))
+                hr_image_paths.extend(str(p) for p in hr_images)
+
+            if not hr_image_paths:
+                raise FileNotFoundError(f"超分辨率处理未产生输出图片: {album_id}")
+
+            # Step 4: 手动 img2pdf 生成 PDF
+            pdf_path = self.download_root / "pdf" / f"{album_id}.pdf"
+            pdf_path.parent.mkdir(parents=True, exist_ok=True)
+
+            def _make_pdf():
+                import img2pdf
+                with open(pdf_path, "wb") as f:
+                    f.write(img2pdf.convert(hr_image_paths))
+
+            await asyncio.to_thread(_make_pdf)
+
+            if not pdf_path.exists():
+                raise FileNotFoundError(f"超分辨率 PDF 生成失败: {pdf_path}")
+            return str(pdf_path.resolve())
+
+    async def _ensure_realesrgan_binary(self):
+        """确保 realesrgan 二进制存在，不存在则自动下载解压。
+
+        返回 exe 的 Path，失败返回 None。
+        """
+        if self.realesrgan_exe.exists():
+            return self.realesrgan_exe
+
+        self.realesrgan_dir.mkdir(parents=True, exist_ok=True)
+        zip_path = self.realesrgan_dir / "realesrgan-ncnn-vulkan.zip"
+
+        try:
+            logger.info(f"开始下载 realesrgan 二进制（约 45MB）: {REALESRGAN_ZIP_URL}")
+
+            def _download_zip():
+                import urllib.request
+                urllib.request.urlretrieve(REALESRGAN_ZIP_URL, str(zip_path))
+
+            await asyncio.to_thread(_download_zip)
+
+            def _extract_zip():
+                import zipfile
+                with zipfile.ZipFile(str(zip_path), "r") as zf:
+                    zf.extractall(str(self.realesrgan_dir))
+
+            await asyncio.to_thread(_extract_zip)
+
+            try:
+                zip_path.unlink()
+            except OSError:
+                pass
+
+            if self.realesrgan_exe.exists():
+                logger.info(f"realesrgan 二进制已就绪: {self.realesrgan_exe}")
+                return self.realesrgan_exe
+
+            for exe in self.realesrgan_dir.rglob(REALESRGAN_EXE_NAME):
+                logger.info(f"realesrgan 二进制找到于: {exe}")
+                return exe
+
+            logger.error(f"realesrgan 二进制解压后未找到: {self.realesrgan_dir}")
+            return None
+
+        except Exception as e:
+            logger.exception(f"realesrgan 二进制下载/解压失败: {e}")
+            return None
 
     async def _encrypt_pdf(self, album_id: str, src_pdf: str) -> str:
         """加密 PDF，返回加密后文件的绝对路径。"""
