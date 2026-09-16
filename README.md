@@ -7,6 +7,40 @@
 >
 > 请自觉控制下载的数量与频率。因滥用造成的一切后果（包括但不限于账号封禁、IP 限制），由使用者自行承担。
 
+<details>
+<summary>🛠️ 开发说明（面向二次开发者，普通用户可忽略）</summary>
+
+#### 项目结构
+
+两个实现相互独立、命令与行为保持一致，核心下载能力均来自 [`jmcomic`](https://github.com/hect0x7/JMComic-Crawler-Python) 库：
+
+| 目录                    | 框架                             | 入口                                            |
+| ----------------------- | -------------------------------- | ----------------------------------------------- |
+| `astrbot_plugin_jmbot/` | AstrBot 插件（主版本，功能最全） | `main.py`，配置定义 `_conf_schema.json`         |
+| `JMBot_v5/`             | NcatBot 独立机器人               | `plugins/JMBot/plugin.py`，清单 `manifest.toml` |
+
+公共逻辑（PDF 加密）分别由各自目录下的 `set_password.py` 提供，目前未抽成共享包，改动需两边同步。
+
+#### 本地开发
+
+1. 建议在独立虚拟环境中安装依赖：`pip install -r astrbot_plugin_jmbot/requirements.txt`（另需一套 AstrBot 运行环境用于加载插件）。
+2. 将插件目录软链 / 拷贝到 AstrBot 的 `data/plugins/astrbot_plugin_jmbot/`，在 WebUI 中「重载插件」即可热更新调试。
+3. 插件运行期数据位于 `data/plugin_data/astrbot_plugin_jmbot/`：`jm_account.json`（凭据）、`realesrgan/`、`waifu2x/`（超分二进制，首次使用自动下载）。
+
+#### 编码约定
+
+- **消息隔离**：所有指令处理器 `priority=500000`（高于陪伴/记忆类插件），认领消息后在全部回复发送完毕调用 `event.stop_event()`，避免其他插件重复响应或把指令写入记忆。
+- **命令兼容**：新增指令时同步处理三件事——`@filter.command` 注册、`on_jm_nospace` 无空格兜底（如 `/jms关键词`）、私聊管理入口的 `SKIP_JM_PATTERN` 跳过正则。
+- **阻塞操作**：jmcomic 下载、subprocess 超分等同步调用一律包 `asyncio.to_thread`，并设置超时。
+- **超分工具**：Real-ESRGAN 与 waifu2x 均为 ncnn-vulkan 外部二进制（无需 torch），统一登记在 `SUPERRES_TOOLS`，新增工具只需补一项配置。
+- 提交前请通过 `python -m py_compile main.py` 与 JSON 校验。
+
+#### 发版流程
+
+更新版本号（`main.py` 的 `@register`、启动日志、`metadata.yaml` 三处）→ 提交推送 → 打同名 tag → 打包根目录为单一 `astrbot_plugin_jmbot/` 的 zip → 创建 GitHub Release 并上传 zip，Release notes 按版本列出变更。
+
+</details>
+
 基于 QQ 机器人框架的禁漫（JM Comic）下载插件：在群聊或私聊中发送漫画 ID，机器人即自动完成下载、生成 PDF 并回传文件。支持批量下载、JM 账号登录、PDF 加密、下载路径自定义与产物定期清理。
 
 本项目提供两种相互独立的部署方式，**推荐使用方法一（NapCat + AstrBot 插件）**——自带 WebUI 可视化配置，Python 依赖自动安装，部署最简单：
