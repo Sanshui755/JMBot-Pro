@@ -57,7 +57,7 @@
 
 下载文件保存在「下载文件保存路径」配置的目录下（留空时默认为 `用户目录\JMBot-Downloads`，Windows 即 `C:\Users\你\JMBot-Downloads`）：
 
-- `stock\` — 下载的图片缓存
+- `stock\` — 下载的图片缓存；超分图片按模型分文件夹存放：`stock\_hr_realesrgan\<本子>\<章节>\` 与 `stock\_hr_waifu2x\<本子>\<章节>\`
 - `pdf\` — 生成的 PDF（即默认在 `用户目录\JMBot-Downloads\pdf`）
 - `encrypt_pdf\` — 加密后的 PDF
 

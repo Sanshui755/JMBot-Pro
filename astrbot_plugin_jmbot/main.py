@@ -45,9 +45,12 @@ HELP_TEXT = (
     "例： /jm 350234\n"
     "支持批量： /jm 350234 350235（或一条消息里发多条 /jm 指令）\n"
     "数字后加中文备注也可以，如 /jm 350234极品\n"
-    "超分辨率下载（画质提升，耗时明显增加请耐心等待）：\n"
+    "超分辨率下载（画质提升）：\n"
     "  /jm -h 350234 用插件配置页选择的默认模型（默认 Real-ESRGAN）\n"
     "  /jm -hr 350234 强制用 Real-ESRGAN，/jm -hw 350234 强制用 waifu2x\n"
+    "  ⚠ 超分需逐张放大图片，耗时比普通下载明显增加（无独显时更慢），\n"
+    "    请耐心等待、勿重复发指令；首次使用会自动下载工具包\n"
+    "    （Real-ESRGAN 约45MB/waifu2x 约35MB，仅一次），PDF 体积也会变大\n"
     "站内搜索：/jms <关键词>（如 /jms 全彩 人妻），结果回复 1 翻页/0 退出\n"
     "按作者搜索：/jma <作者名>（如 /jma AREA188），结果回复 1 翻页/0 退出\n"
     "只看详情不下载：/jmv 350234（可直接粘贴含车号的链接或整段文本）\n"
@@ -157,7 +160,7 @@ SUPERRES_TOOLS = {
 }
 
 
-@register("astrbot_plugin_jmbot", "Sanshui755", "禁漫下载插件，批量下载/搜索翻页/双模型超分辨率/路径可配/自动清理", "2.0.0", "")
+@register("astrbot_plugin_jmbot", "Sanshui755", "禁漫下载插件，批量下载/搜索翻页/双模型超分辨率/路径可配/自动清理", "2.0.1", "")
 class JMBot(Star):
     """JMBot 插件"""
 
@@ -236,7 +239,7 @@ class JMBot(Star):
         self._background_tasks.add(cleanup_task)
         cleanup_task.add_done_callback(self._background_tasks.discard)
 
-        logger.info("JMBot v2.0.0 已加载（指令消息已隔离：屏蔽默认 LLM 与陪伴/记忆插件）")
+        logger.info("JMBot v2.0.1 已加载（指令消息已隔离：屏蔽默认 LLM 与陪伴/记忆插件）")
         logger.info(f"JMBot 插件超管: {self.super_user or '(未配置)'}")
         logger.info(f"JMBot 下载目录: {self.download_root}")
 
@@ -1308,12 +1311,19 @@ class JMBot(Star):
                 raise FileNotFoundError(f"下载完成但未找到图片文件: {album_id}")
 
             # Step 3: 运行超分工具（按 photo 目录分组）
+            # 输出统一放到 stock/_hr_<模型>/ 下，保留 <本子>/<章节> 层级，
+            # Real-ESRGAN 与 waifu2x 各自独立顶层文件夹，互不覆盖。
+            stock_root = self.download_root / "stock"
+            hr_model_root = stock_root / f"_hr_{model}"
             input_dirs = sorted(set(Path(p).parent for p in image_paths))
             hr_image_paths: list[str] = []
 
             for img_dir in input_dirs:
-                # 目录名带上模型后缀，避免两套工具的输出互相覆盖
-                hr_dir = img_dir.parent / f"{img_dir.name}_hr_{model}"
+                try:
+                    rel = img_dir.relative_to(stock_root)
+                except ValueError:
+                    rel = Path(img_dir.parent.name) / img_dir.name
+                hr_dir = hr_model_root / rel
                 hr_dir.mkdir(parents=True, exist_ok=True)
 
                 cmd = [
