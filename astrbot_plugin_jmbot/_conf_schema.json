@@ -25,6 +25,14 @@
         "secret": true,
         "hint": "群聊加密PDF使用的密码，私聊发送的PDF不加密。"
     },
+    "superres_model": {
+        "description": "超分辨率默认模型（/jm -h 使用）",
+        "type": "string",
+        "default": "realesrgan",
+        "options": ["realesrgan", "waifu2x"],
+        "labels": ["Real-ESRGAN（动漫模型，4x 放大，约45MB工具包）", "waifu2x（cunet 动漫模型，2x 放大，约35MB工具包）"],
+        "hint": "发送 /jm -h <id> 时使用的默认超分模型；也可用 /jm -hr 强制指定 Real-ESRGAN、/jm -hw 强制指定 waifu2x。超分需要逐张放大图片，耗时会明显增加，请耐心等待；首次使用某模型时会自动下载对应工具包。"
+    },
     "jm_username": {
         "description": "JM 账号（禁漫用户名）",
         "type": "string",

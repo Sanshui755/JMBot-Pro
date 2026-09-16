@@ -45,10 +45,11 @@ HELP_TEXT = (
     "例： /jm 350234\n"
     "支持批量： /jm 350234 350235（或一条消息里发多条 /jm 指令）\n"
     "数字后加中文备注也可以，如 /jm 350234极品\n"
-    "超分辨率下载（画质提升）：/jm -h 350234 或 /jm 350234 -h（默认 Real-ESRGAN）\n"
-    "  /jm -hr 350234 用 Real-ESRGAN，/jm -hw 350234 用 waifu2x\n"
-    "站内搜索：/jms <关键词>（如 /jms 全彩 人妻）\n"
-    "按作者搜索：/jma <作者名>（如 /jma AREA188）\n"
+    "超分辨率下载（画质提升，耗时明显增加请耐心等待）：\n"
+    "  /jm -h 350234 用插件配置页选择的默认模型（默认 Real-ESRGAN）\n"
+    "  /jm -hr 350234 强制用 Real-ESRGAN，/jm -hw 350234 强制用 waifu2x\n"
+    "站内搜索：/jms <关键词>（如 /jms 全彩 人妻），结果回复 1 翻页/0 退出\n"
+    "按作者搜索：/jma <作者名>（如 /jma AREA188），结果回复 1 翻页/0 退出\n"
     "只看详情不下载：/jmv 350234（可直接粘贴含车号的链接或整段文本）\n"
     "下载的文件仅在本机保留3天，到期自动删除\n"
     "如有pdf有密码,默认密码为114514"
@@ -66,14 +67,16 @@ JMS_HELP_TEXT = (
     "站内搜索：/jms <关键词>\n"
     "例：/jms 全彩 人妻\n"
     "支持无空格写法：/jms全彩\n"
-    "搜索结果默认显示前 10 条，需要下载请发送 /jm <id>"
+    "每页显示 10 条：回复 1 查看下 10 条，回复 0 退出（5 分钟内仅你本人操作有效）\n"
+    "需要下载请发送 /jm <id>"
 )
 
 JMA_HELP_TEXT = (
     "按作者搜索：/jma <作者名>\n"
     "例：/jma AREA188\n"
     "支持无空格写法：/jmaAREA188\n"
-    "搜索结果默认显示前 10 条，需要下载请发送 /jm <id>"
+    "每页显示 10 条：回复 1 查看下 10 条，回复 0 退出（5 分钟内仅你本人操作有效）\n"
+    "需要下载请发送 /jm <id>"
 )
 
 ADMIN_HELP_TEXT = (
@@ -110,6 +113,8 @@ LEGACY_DOWNLOAD_ROOTS: tuple[str, ...] = ()
 
 # ---------------- 搜索 ----------------
 SEARCH_RESULTS_PER_PAGE = 10
+# 搜索翻页会话有效期（秒）：发起搜索后 5 分钟内回复 1/0 有效
+SEARCH_SESSION_TTL = 300
 # 私聊跳过正则：覆盖 jm/jmv/jms/jma 所有形态
 # v 后必须跟 空格/数字/结尾（不匹配 /jmversion）
 # s/a 后跟任意非空字符（关键词可任意开头）
@@ -152,7 +157,7 @@ SUPERRES_TOOLS = {
 }
 
 
-@register("astrbot_plugin_jmbot", "Sanshui755", "禁漫下载插件，批量下载/搜索/双模型超分辨率/路径可配/自动清理", "1.6.1", "")
+@register("astrbot_plugin_jmbot", "Sanshui755", "禁漫下载插件，批量下载/搜索翻页/双模型超分辨率/路径可配/自动清理", "2.0.0", "")
 class JMBot(Star):
     """JMBot 插件"""
 
@@ -192,6 +197,9 @@ class JMBot(Star):
             self.superres_exes[_model] = _dir / _cfg["exe"]
         # 超分辨率下载互斥锁（保护 img2pdf 插件临时禁用/恢复）
         self._super_res_lock = asyncio.Lock()
+        # 搜索翻页会话：key=(会话ID, 用户QQ) → 会话数据
+        # 群聊中每位用户各自独立，只有发起人回复 1/0 才会命中自己的会话
+        self._search_sessions: dict[tuple[str, str], dict] = {}
 
         # 后台把历史下载目录（旧版本布局）迁到当前路径
         self._migration_task = asyncio.create_task(
@@ -228,7 +236,7 @@ class JMBot(Star):
         self._background_tasks.add(cleanup_task)
         cleanup_task.add_done_callback(self._background_tasks.discard)
 
-        logger.info("JMBot v1.6.1 已加载（指令消息已隔离：屏蔽默认 LLM 与陪伴/记忆插件）")
+        logger.info("JMBot v2.0.0 已加载（指令消息已隔离：屏蔽默认 LLM 与陪伴/记忆插件）")
         logger.info(f"JMBot 插件超管: {self.super_user or '(未配置)'}")
         logger.info(f"JMBot 下载目录: {self.download_root}")
 
@@ -272,6 +280,12 @@ class JMBot(Star):
     def pdf_password(self, value: str) -> None:
         self.config["pdf_password"] = value
         self._save_config()
+
+    @property
+    def default_superres_model(self) -> str:
+        """配置页选择的默认超分模型，仅允许 SUPERRES_TOOLS 中已有的键。"""
+        value = str(self.config.get("superres_model", "realesrgan")).strip().lower()
+        return value if value in SUPERRES_TOOLS else "realesrgan"
 
     def _save_config(self) -> None:
         """保存 WebUI 配置（直接修改文件的场景需要手动落盘）。"""
@@ -374,16 +388,20 @@ class JMBot(Star):
         """从命令文本检测超分辨率标志。
 
         - ``/jm -hw <id>`` → ("waifu2x", 去掉标志后的文本)
-        - ``/jm -h <id>`` / ``/jm -hr <id>`` → ("realesrgan", 去掉标志后的文本)
+        - ``/jm -hr <id>`` → ("realesrgan", 去掉标志后的文本)
+        - ``/jm -h <id>``  → ("default", 去掉标志后的文本)，
+          具体模型由插件配置页 superres_model 决定
         - 无标志 → (None, 原文)
 
-        注意必须先判 ``-hw``：``-h`` 的正则不允许后跟 ``w``，所以
-        ``-hw`` 不会被误判为 Real-ESRGAN。
+        注意三个分支必须按 -hw / -hr / -h 顺序判断，``-h`` 的正则
+        不允许后跟字母，所以 -hr、-hw 都不会被误判为 default。
         """
         if re.search(r"(?:^|\s)-hw(?:\s|$)", text, re.IGNORECASE):
             model = "waifu2x"
-        elif re.search(r"(?:^|\s)-h(?:r)?(?:\s|$)", text, re.IGNORECASE):
+        elif re.search(r"(?:^|\s)-hr(?:\s|$)", text, re.IGNORECASE):
             model = "realesrgan"
+        elif re.search(r"(?:^|\s)-h(?:\s|$)", text, re.IGNORECASE):
+            model = "default"
         else:
             return None, text
         clean = re.sub(r"(?:^|\s)-h(?:r|w)?(?=\s|$)", "", text, flags=re.IGNORECASE)
@@ -421,9 +439,11 @@ class JMBot(Star):
             # 群聊开关关闭：静默忽略，避免打扰群聊
             return
 
-        # 检测超分辨率标志：-h/-hr → realesrgan，-hw → waifu2x
+        # 检测超分辨率标志：-h → 配置页默认模型，-hr → realesrgan，-hw → waifu2x
         raw_text = event.message_str or ""
         super_model, clean_text = self._detect_super_res(raw_text)
+        if super_model == "default":
+            super_model = self.default_superres_model
 
         # 从消息原文解析全部车号（/jm a b、多条 /jm、数字后带中文备注均支持）
         album_ids = self._parse_album_ids(clean_text)
@@ -435,7 +455,10 @@ class JMBot(Star):
         id_preview = "、".join(album_ids)
         if super_model:
             mode_label = SUPERRES_TOOLS[super_model]["label"]
-            mode_hint = f"（{mode_label} 超分辨率模式，速度较慢）"
+            mode_hint = (
+                f"（{mode_label} 超分辨率模式：图片需逐张放大，"
+                f"耗时比普通下载明显增加，请耐心等待）"
+            )
         else:
             mode_hint = ""
         yield event.plain_result(f"开始下载 {total} 个本子{mode_hint}：{id_preview}，请稍候……")
@@ -524,26 +547,16 @@ class JMBot(Star):
 
     async def _jms_impl(self, event: AstrMessageEvent, keyword: str):
         """站内搜索流程，供标准指令与无空格兜底共用。"""
-        self._claim(event)
-        is_group = not event.is_private_chat()
-        if is_group and not self.jm_on:
-            return
-
-        keyword = keyword.strip()
-        if not keyword:
-            yield event.plain_result(JMS_HELP_TEXT)
-            return
-
-        yield event.plain_result(f"正在搜索「{keyword}」……")
-        try:
-            page = await self._fetch_search_page(keyword, search_type="site")
-            yield event.plain_result(self._format_search_results(keyword, page))
-        except Exception as e:
-            logger.exception(f"/jms 搜索「{keyword}」失败: {e}")
-            yield event.plain_result(f"搜索失败：{e}")
+        async for ret in self._run_search(event, keyword, "site"):
+            yield ret
 
     async def _jma_impl(self, event: AstrMessageEvent, keyword: str):
         """按作者搜索流程，供标准指令与无空格兜底共用。"""
+        async for ret in self._run_search(event, keyword, "author"):
+            yield ret
+
+    async def _run_search(self, event: AstrMessageEvent, keyword: str, search_type: str):
+        """搜索主流程（/jms、/jma 共用），首页结果落地为翻页会话。"""
         self._claim(event)
         is_group = not event.is_private_chat()
         if is_group and not self.jm_on:
@@ -551,16 +564,134 @@ class JMBot(Star):
 
         keyword = keyword.strip()
         if not keyword:
-            yield event.plain_result(JMA_HELP_TEXT)
+            yield event.plain_result(JMA_HELP_TEXT if search_type == "author" else JMS_HELP_TEXT)
             return
 
-        yield event.plain_result(f"正在搜索作者「{keyword}」……")
+        searching = f"正在搜索作者「{keyword}」……" if search_type == "author" else f"正在搜索「{keyword}」……"
+        yield event.plain_result(searching)
         try:
-            page = await self._fetch_search_page(keyword, search_type="author")
-            yield event.plain_result(self._format_search_results(keyword, page, is_author=True))
+            page = await self._fetch_search_page(keyword, search_type=search_type, page=1)
         except Exception as e:
-            logger.exception(f"/jma 搜索作者「{keyword}」失败: {e}")
+            logger.exception(f"搜索「{keyword}」失败: {e}")
             yield event.plain_result(f"搜索失败：{e}")
+            return
+
+        results = list(page.iter_id_title_tag())
+        total = int(getattr(page, "total", 0) or 0)
+        if not results:
+            label = "作者" if search_type == "author" else "站内"
+            yield event.plain_result(f"{label}搜索「{keyword}」无结果")
+            return
+
+        # 落地翻页会话（只有搜索发起人回复 1/0 才会命中）
+        shown = min(SEARCH_RESULTS_PER_PAGE, len(results))
+        self._search_sessions[self._search_session_key(event)] = {
+            "query": keyword,
+            "type": search_type,
+            "buffer": results,
+            "api_page": 1,
+            "shown": shown,
+            "total": total,
+            "expire": time.time() + SEARCH_SESSION_TTL,
+        }
+        yield event.plain_result(
+            self._format_search_batch(keyword, search_type, results[:shown], 0, shown, total)
+        )
+
+    def _search_session_key(self, event: AstrMessageEvent) -> tuple[str, str]:
+        """翻页会话键：群聊=(群号, 用户QQ)，私聊=("pv", 用户QQ)。
+
+        群内不同用户的键不同，天然保证只有搜索发起人能操作自己的会话。
+        """
+        user_id = str(event.get_sender_id())
+        if event.is_private_chat():
+            return ("pv", user_id)
+        return (str(event.get_group_id() or ""), user_id)
+
+    @filter.event_message_type(
+        filter.EventMessageType.GROUP_MESSAGE | filter.EventMessageType.PRIVATE_MESSAGE,
+        priority=500000,
+    )
+    async def on_search_page_control(self, event: AstrMessageEvent):
+        """搜索翻页控制：有活跃搜索会话时，发起人回复 1 翻页 / 0 退出。"""
+        async for ret in self._on_search_page_control_impl(event):
+            yield ret
+        if event.get_extra("jmbot_claimed"):
+            event.stop_event()
+
+    async def _on_search_page_control_impl(self, event: AstrMessageEvent):
+        """仅在「发起人 + 5 分钟内 + 文本恰为 1/0」时接管消息，其余一律放行。"""
+        text = (event.message_str or "").strip()
+        if text not in ("0", "1"):
+            return
+
+        is_group = not event.is_private_chat()
+        if is_group and not self.jm_on:
+            return
+
+        key = self._search_session_key(event)
+        session = self._search_sessions.get(key)
+        if session is None:
+            # 该用户没有进行中的搜索（群里其他用户发的 1/0 也走这里）→ 放行
+            return
+
+        self._claim(event)
+
+        if time.time() > session["expire"]:
+            self._search_sessions.pop(key, None)
+            yield event.plain_result(
+                f"搜索会话已过期（超过 {SEARCH_SESSION_TTL // 60} 分钟），"
+                f"请重新发送 /jms 或 /jma 搜索。"
+            )
+            return
+
+        if text == "0":
+            self._search_sessions.pop(key, None)
+            yield event.plain_result("已退出搜索。")
+            return
+
+        # text == "1"：取下一批 10 条
+        if session["shown"] >= session["total"]:
+            yield event.plain_result("已经是最后一批结果了，回复 0 退出搜索。")
+            return
+
+        yield event.plain_result("正在翻页……")
+
+        # 本地缓冲不足时再请求下一个 API 页追加到缓冲
+        while session["shown"] >= len(session["buffer"]) and len(session["buffer"]) < session["total"]:
+            next_api_page = session["api_page"] + 1
+            try:
+                p = await self._fetch_search_page(
+                    session["query"], search_type=session["type"], page=next_api_page
+                )
+            except Exception as e:
+                logger.exception(
+                    f"搜索翻页失败「{session['query']}」page={next_api_page}: {e}"
+                )
+                yield event.plain_result(f"翻页失败：{e}")
+                return
+            new_items = list(p.iter_id_title_tag())
+            if not new_items:
+                break
+            session["buffer"].extend(new_items)
+            session["api_page"] = next_api_page
+
+        start = session["shown"]
+        end = min(start + SEARCH_RESULTS_PER_PAGE, len(session["buffer"]), session["total"])
+        batch = session["buffer"][start:end]
+        if not batch:
+            # API 已无更多数据但 total 虚高，按实际结果收尾
+            session["total"] = len(session["buffer"])
+            yield event.plain_result("已经是最后一批结果了，回复 0 退出搜索。")
+            return
+
+        session["shown"] = end
+        session["expire"] = time.time() + SEARCH_SESSION_TTL
+        yield event.plain_result(
+            self._format_search_batch(
+                session["query"], session["type"], batch, start, end, session["total"]
+            )
+        )
 
     @filter.event_message_type(
         filter.EventMessageType.GROUP_MESSAGE | filter.EventMessageType.PRIVATE_MESSAGE,
@@ -607,6 +738,8 @@ class JMBot(Star):
         # 先去掉超分标志再匹配数字模式
         raw_text = event.message_str or ""
         super_model, clean_text = self._detect_super_res(raw_text)
+        if super_model == "default":
+            super_model = self.default_superres_model
         clean_text = clean_text.strip()
 
         if not re.match(r"/?jm\d+", clean_text, re.IGNORECASE):
@@ -627,7 +760,10 @@ class JMBot(Star):
         id_preview = "、".join(album_ids)
         if super_model:
             mode_label = SUPERRES_TOOLS[super_model]["label"]
-            mode_hint = f"（{mode_label} 超分辨率模式，速度较慢）"
+            mode_hint = (
+                f"（{mode_label} 超分辨率模式：图片需逐张放大，"
+                f"耗时比普通下载明显增加，请耐心等待）"
+            )
         else:
             mode_hint = ""
         yield event.plain_result(f"开始下载 {total} 个本子{mode_hint}：{id_preview}，请稍候……")
@@ -976,25 +1112,26 @@ class JMBot(Star):
             logger.info(f"/jmv HTML 客户端失败({e})，回退到 API 客户端: {album_id}")
         return await asyncio.to_thread(_query_api)
 
-    async def _fetch_search_page(self, query: str, search_type: str = "site"):
+    async def _fetch_search_page(self, query: str, search_type: str = "site", page: int = 1):
         """调用 JM 搜索 API，返回 JmSearchPage。
 
         优先使用网页端客户端（标签更完整），20 秒超时后回退移动端 API。
         search_type: "site" → search_site, "author" → search_author
+        page: API 页码（每页条数由 JM 端决定，本地再按 10 条切片展示）
         """
         await self._ensure_jm_login()
 
         def _search_html():
             client = self.jm_option.new_jm_client(impl="html")
             if search_type == "author":
-                return client.search_author(query, page=1)
-            return client.search_site(query, page=1)
+                return client.search_author(query, page=page)
+            return client.search_site(query, page=page)
 
         def _search_api():
             client = self.jm_option.build_jm_client()
             if search_type == "author":
-                return client.search_author(query, page=1)
-            return client.search_site(query, page=1)
+                return client.search_author(query, page=page)
+            return client.search_site(query, page=page)
 
         try:
             return await asyncio.wait_for(
@@ -1007,34 +1144,41 @@ class JMBot(Star):
         return await asyncio.to_thread(_search_api)
 
     @staticmethod
-    def _format_search_results(query: str, page, is_author: bool = False) -> str:
-        """把 JmSearchPage 渲染为搜索结果文本（前 10 条）。"""
-        search_label = "作者" if is_author else "站内"
-        total = getattr(page, "total", 0) or 0
-        results = list(page.iter_id_title_tag())
+    def _format_search_batch(
+        query: str,
+        search_type: str,
+        batch: list,
+        start: int,
+        shown: int,
+        total: int,
+    ) -> str:
+        """渲染一批（10 条）搜索结果，start 为本批第一条在全局结果中的 0 基下标。
 
-        if not results:
-            return f"{search_label}搜索「{query}」无结果"
-
-        results = results[:SEARCH_RESULTS_PER_PAGE]
-
+        尾部附带翻页操作提示：未到末尾提示回复 1/0，到末尾只提示 0。
+        """
+        search_label = "作者" if search_type == "author" else "站内"
         lines = [
             f"{search_label}搜索「{query}」的结果"
-            f"（共 {total} 个，显示前 {len(results)} 个）："
+            f"（共 {total} 个，当前第 {start + 1}-{shown} 个）："
         ]
-        for i, (aid, title, tags) in enumerate(results, 1):
+        for offset, (aid, title, tags) in enumerate(batch):
             title_short = (title or "(无标题)")[:40]
-            tag_text = ""
+            lines.append(f"{start + offset + 1}. [{aid}] {title_short}")
             if tags:
                 tag_list = [str(t) for t in tags[:5]]
                 tag_text = "、".join(tag_list)
                 if len(tag_text) > 30:
                     tag_text = tag_text[:30] + "…"
-            lines.append(f"{i}. [{aid}] {title_short}")
-            if tag_text:
                 lines.append(f"   标签：{tag_text}")
 
-        lines.append(f"需要下载请发送：/jm <id>（超分辨率下载：/jm -h <id>）")
+        if shown < total:
+            lines.append(
+                "—— 回复 1 查看下 10 条，回复 0 退出"
+                f"（{SEARCH_SESSION_TTL // 60} 分钟内有效，仅你本人操作有效）"
+            )
+        else:
+            lines.append("—— 已到最后一条，回复 0 退出搜索")
+        lines.append("需要下载请发送：/jm <id>（超分辨率下载：/jm -h <id>）")
         return "\n".join(lines)
 
     @staticmethod
