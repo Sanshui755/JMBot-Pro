@@ -4,6 +4,8 @@ JMBot —— AstrBot 版禁漫下载插件
 群聊 / 私聊发送 ``/jm <id>``，机器人自动下载相册、生成 PDF 并发送文件。
 支持批量：``/jm 350234 350235`` 或一条消息内多条 ``/jm`` 指令，
 数字后紧跟中文备注（如 ``/jm 350234极品``）也能正确识别。
+发送 ``/jmv <任意含车号的文本>`` 只查询本子详情（标题/作者/标签/页数等），
+不下载任何图片，支持直接粘贴链接或整段文本，自动从中提取车号。
 下载产物（stock/pdf/encrypt_pdf）统一保存在「下载路径」下的三个子文件夹中，
 默认为用户目录下的 JMBot-Downloads（Windows: C:\\Users\\你\\JMBot-Downloads），
 可用超管私聊命令「设置下载路径 xxx」修改；
@@ -43,8 +45,17 @@ HELP_TEXT = (
     "例： /jm 350234\n"
     "支持批量： /jm 350234 350235（或一条消息里发多条 /jm 指令）\n"
     "数字后加中文备注也可以，如 /jm 350234极品\n"
+    "只看详情不下载：/jmv 350234（可直接粘贴含车号的链接或整段文本）\n"
     "下载的文件仅在本机保留3天，到期自动删除\n"
     "如有pdf有密码,默认密码为114514"
+)
+
+JMV_HELP_TEXT = (
+    "本子详情查询（只看不下载）：\n"
+    "输入 /jmv+空格+任意含车号的内容，机器人会自动提取其中的数字。\n"
+    "例： /jmv 350234\n"
+    "也可直接粘贴链接或整段文本，如：/jmv https://18comic.vip/album/350234/\n"
+    "需要下载请发送 /jm 350234"
 )
 
 ADMIN_HELP_TEXT = (
@@ -80,7 +91,7 @@ DEFAULT_DOWNLOAD_ROOT = str(Path.home() / "JMBot-Downloads")
 LEGACY_DOWNLOAD_ROOTS: tuple[str, ...] = ()
 
 
-@register("astrbot_plugin_jmbot", "Sanshui755", "禁漫下载插件，批量下载/路径可配/自动清理", "1.4.0", "")
+@register("astrbot_plugin_jmbot", "Sanshui755", "禁漫下载插件，批量下载/路径可配/自动清理", "1.5.0", "")
 class JMBot(Star):
     """JMBot 插件"""
 
@@ -146,7 +157,7 @@ class JMBot(Star):
         self._background_tasks.add(cleanup_task)
         cleanup_task.add_done_callback(self._background_tasks.discard)
 
-        logger.info("JMBot v1.4.0 已加载（指令消息已隔离：屏蔽默认 LLM 与陪伴/记忆插件）")
+        logger.info("JMBot v1.5.0 已加载（指令消息已隔离：屏蔽默认 LLM 与陪伴/记忆插件）")
         logger.info(f"JMBot 插件超管: {self.super_user or '(未配置)'}")
         logger.info(f"JMBot 下载目录: {self.download_root}")
 
@@ -356,25 +367,68 @@ class JMBot(Star):
             lines.append(f"{aid}：{reason}")
         yield event.plain_result("\n".join(lines))
 
+    # ------------------------------------------------------------------
+    # /jmv 本子详情查询（不下载，群聊/私聊均可触发）
+    # ------------------------------------------------------------------
+
+    @filter.command("jmv", priority=500000)
+    async def cmd_jmv(self, event: AstrMessageEvent):
+        """查看本子详情：/jmv <任意含车号的文本>，自动提取数字，只查不下载。"""
+        async for ret in self._jmv_impl(event, event.message_str or ""):
+            yield ret
+        if event.get_extra("jmbot_claimed"):
+            event.stop_event()
+
+    async def _jmv_impl(self, event: AstrMessageEvent, text: str):
+        """本子详情查询流程，供标准指令与无空格兜底共用。"""
+        # 与 /jm 相同的消息隔离策略
+        self._claim(event)
+
+        is_group = not event.is_private_chat()
+        if is_group and not self.jm_on:
+            # 群聊开关关闭：静默忽略，与 /jm 保持一致
+            return
+
+        album_id = self._extract_album_id(text)
+        if not album_id:
+            yield event.plain_result(JMV_HELP_TEXT)
+            return
+
+        yield event.plain_result(f"正在查询本子 {album_id} 的详情……")
+        try:
+            detail = await self._fetch_album_detail(album_id)
+            yield event.plain_result(self._format_album_detail(detail))
+        except Exception as e:
+            logger.exception(f"/jmv 查询本子 {album_id} 详情失败: {e}")
+            yield event.plain_result(self._format_view_error(album_id, e))
+
     @filter.event_message_type(
         filter.EventMessageType.GROUP_MESSAGE | filter.EventMessageType.PRIVATE_MESSAGE,
         priority=500000,
     )
     async def on_jm_nospace(self, event: AstrMessageEvent):
-        """兜底：识别无空格写法 ``/jm350234``。"""
+        """兜底：识别无空格写法 ``/jm350234`` / ``/jmv350234``。"""
         async for ret in self._on_jm_nospace_impl(event):
             yield ret
         if event.get_extra("jmbot_claimed"):
             event.stop_event()
 
     async def _on_jm_nospace_impl(self, event: AstrMessageEvent):
-        """兜底：识别无空格写法 ``/jm350234``。
+        """兜底：识别无空格写法 ``/jm350234`` / ``/jmv350234``。
 
-        标准指令过滤器只认 ``jm`` 后接空格/结尾，``jm350234``（群聊唤醒
-        前缀 ``/`` 被剥掉）或私聊原文 ``/jm350234`` 都不会命中指令处理器，
-        这里统一接住并解析。
+        标准指令过滤器只认 ``jm``/``jmv`` 后接空格/结尾，``jm350234``
+        （群聊唤醒前缀 ``/`` 被剥掉）或私聊原文 ``/jm350234`` 都不会命中
+        指令处理器，这里统一接住并解析。``v`` 后必须紧跟数字才按详情查询
+        处理，避免误吞 /jmversion 之类的普通单词。
         """
         text = (event.message_str or "").strip()
+
+        # /jmv350234：直接走详情查询流程（与 /jm\d+ 互斥，不会同时命中）
+        if re.match(r"/?jmv(?=\d)", text, re.IGNORECASE):
+            async for ret in self._jmv_impl(event, text):
+                yield ret
+            return
+
         if not re.match(r"/?jm\d+", text, re.IGNORECASE):
             return
 
@@ -461,9 +515,10 @@ class JMBot(Star):
         user_id = str(event.get_sender_id())
         logger.info(f"私聊消息: {text} (from {user_id})")
 
-        # /jm 下载指令交给指令处理器与无空格兜底处理器，这里不重复处理
-        # （/jm、/jm 350234、/jm350234 均跳过；JM状态/JM帮助 等中文命令不受影响）
-        if re.match(r"/?jm(?:\s|\d|$)", text, re.IGNORECASE):
+        # /jm、/jmv 指令交给指令处理器与无空格兜底处理器，这里不重复处理
+        # （/jm、/jm 350234、/jm350234、/jmv 350234、/jmv350234 均跳过；
+        # JM状态/JM帮助 等中文命令不受影响）
+        if re.match(r"/?jmv?(?:\s|\d|$)", text, re.IGNORECASE):
             return
 
         # 以下管理命令仅超管可用：非超管对任何其他消息只提示一次，避免刷屏
@@ -673,6 +728,27 @@ class JMBot(Star):
         return list(dict.fromkeys(album_ids))
 
     @staticmethod
+    def _extract_album_id(text: str) -> str:
+        """从任意文本中提取一个本子 id（``/jmv`` 专用）。
+
+        去掉开头的 ``/jmv`` 指令后：
+        1. 优先取 ``album``/``photo``/``jm`` 关键字附近的数字，
+           兼容直接粘贴的站点链接（如 .../album/350234/）；
+        2. 否则取文本中最长的连续数字（至少 4 位），一样长取第一个，
+           尽量避开年份等短数字干扰。
+        """
+        body = re.sub(r"^/?jmv\s*", "", text.strip(), count=1, flags=re.IGNORECASE)
+        context_match = re.search(
+            r"(?:album|photo|jm)[^\d\n]{0,10}?(\d{4,})", body, re.IGNORECASE
+        )
+        if context_match:
+            return context_match.group(1)
+        candidates = re.findall(r"\d{4,}", body)
+        if candidates:
+            return max(candidates, key=len)
+        return ""
+
+    @staticmethod
     def _format_download_error(album_id: str, e: Exception) -> str:
         """把下载阶段的异常转换为发给用户的友好提示。"""
         if isinstance(e, MissingAlbumPhotoException):
@@ -680,6 +756,112 @@ class JMBot(Star):
         if isinstance(e, FileNotFoundError) and "未找到生成的 PDF" in str(e):
             return ALBUM_NOT_FOUND_TEXT.format(album=album_id)
         return f"下载/发送失败：{e}"
+
+    @staticmethod
+    def _format_view_error(album_id: str, e: Exception) -> str:
+        """把详情查询阶段的异常转换为发给用户的友好提示。"""
+        if isinstance(e, MissingAlbumPhotoException):
+            return ALBUM_NOT_FOUND_TEXT.format(album=album_id)
+        return f"查询本子详情失败：{e}"
+
+    async def _fetch_album_detail(self, album_id: str):
+        """请求本子详情实体（只发一次详情请求，不下载任何图片）。
+
+        优先使用网页端客户端（标签/作者/页数/日期更完整），失败则回退
+        到移动端 API（标签偏少、无页数和日期，但至少能返回基本信息）。
+        """
+        await self._ensure_jm_login()
+
+        async def _query_html():
+            """用网页端客户端查询，15 秒超时防卡死。"""
+            def _do():
+                client = self.jm_option.new_jm_client(impl="html")
+                return client.get_album_detail(album_id)
+            return await asyncio.to_thread(_do)
+
+        def _query_api():
+            """用移动端 API 客户端查询（回退方案）。"""
+            client = self.jm_option.build_jm_client()
+            return client.get_album_detail(album_id)
+
+        try:
+            return await asyncio.wait_for(_query_html(), timeout=15)
+        except asyncio.TimeoutError:
+            logger.info(f"/jmv HTML 客户端超时，回退到 API 客户端: {album_id}")
+        except Exception as e:
+            logger.info(f"/jmv HTML 客户端失败({e})，回退到 API 客户端: {album_id}")
+        return await asyncio.to_thread(_query_api)
+
+    @staticmethod
+    def _format_album_detail(detail) -> str:
+        """把 JmAlbumDetail 渲染成发给用户的纯文本详情。
+
+        移动端 API 不返回页数/发布日期/更新日期（对应字段为 0 或
+        ``'0'``），也不返回完整标签和作者。这些字段仅在有有效值时展示。
+        作者为空时从标题方括号 ``[xxx]`` 中提取作为备选。
+        """
+
+        def join_list(items) -> str:
+            cleaned = [str(x).strip() for x in (items or []) if str(x).strip()]
+            return "、".join(cleaned) if cleaned else "无"
+
+        tags = list(detail.tags or [])
+        tag_text = join_list(tags)
+
+        lines = [
+            f"本子详情（车号 {detail.album_id}）",
+            f"标题：{detail.name or '无'}",
+        ]
+
+        # 作者：优先取 API/HTML 返回；为空则从标题 [xxx] 方括号提取
+        authors = join_list(detail.authors)
+        if authors == "无":
+            brackets = re.findall(r"\[([^\]]+)\]", detail.name or "")
+            if brackets:
+                authors = "、".join(brackets)
+        if authors != "无":
+            lines.append(f"作者：{authors}")
+
+        actors = join_list(detail.actors)
+        if actors != "无":
+            lines.append(f"登场人物：{actors}")
+
+        works = join_list(detail.works)
+        if works != "无":
+            lines.append(f"作品：{works}")
+
+        lines.append(f"标签：{tag_text}")
+
+        # 页数/章节：移动端 API 恒为 0，仅网页端能取到时才展示
+        page_count = int(getattr(detail, "page_count", 0) or 0)
+        if page_count > 0:
+            episode_count = len(detail.episode_list)
+            suffix = f"（共 {episode_count} 章）" if episode_count > 1 else ""
+            lines.append(f"页数：{page_count} 页{suffix}")
+
+        # 发布/更新日期：移动端 API 恒为 '0'，仅有效值才展示
+        pub_date = str(getattr(detail, "pub_date", "") or "").strip()
+        update_date = str(getattr(detail, "update_date", "") or "").strip()
+        if pub_date and pub_date != "0":
+            lines.append(f"发布：{pub_date}")
+        if update_date and update_date != "0":
+            lines.append(f"更新：{update_date}")
+
+        lines.append(
+            f"喜欢：{detail.likes or 0} ｜ 观看：{detail.views or 0}"
+            f" ｜ 评论：{detail.comment_count}"
+        )
+
+        description = str(getattr(detail, "description", "") or "").strip()
+        if description:
+            # 简介可能很长，截断防止消息过长
+            if len(description) > 120:
+                description = description[:120] + "…"
+            lines.append(f"简介：{description}")
+
+        lines.append(f"链接：https://18comic.vip/album/{detail.album_id}/")
+        lines.append(f"需要下载请发送：/jm {detail.album_id}")
+        return "\n".join(lines)
 
     async def _fetch_pdf(self, album_id: str) -> str:
         """下载相册并生成 PDF，返回 PDF 绝对路径。"""
