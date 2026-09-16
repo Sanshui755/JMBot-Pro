@@ -21,3 +21,4 @@ data/
 NapCat.Shell/
 *.zip
 .DS_Store
+.trae/
