@@ -24,6 +24,7 @@ import asyncio
 import json
 import re
 import shutil
+import threading
 import time
 from pathlib import Path
 
@@ -34,6 +35,7 @@ from astrbot.api.message_components import File
 from astrbot.api.star import Context, Star, register
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 from jmcomic.jm_exception import MissingAlbumPhotoException
+from jmcomic.jm_plugin import JmOptionPlugin
 
 from .set_password import set_password_pdf
 
@@ -131,6 +133,9 @@ SKIP_JM_PATTERN = r"/?jm(?:v(?=\s|\d|$)|[sa]|(?=\s|\d|$))"
 #   Real-ESRGAN: -n <模型名> -s <放大倍数>
 #   waifu2x:      -n <降噪级别 0-3> -s <放大倍数>（模型由内置 models-cunet 提供）
 SUPERRES_FORMAT = "jpg"
+# 单张超分 subprocess 超时（秒）：waifu2x 在中端独显上约 20-30s/张，留足余量。
+# 逐张调用下单张卡死/崩溃只损失该张（回退原图），不再像整章超时那样损失全章。
+SUPERRES_PER_IMAGE_TIMEOUT = 240
 SUPERRES_TOOLS = {
     "realesrgan": {
         "dir": "realesrgan",
@@ -160,7 +165,97 @@ SUPERRES_TOOLS = {
 }
 
 
-@register("astrbot_plugin_jmbot", "Sanshui755", "禁漫下载插件，批量下载/搜索翻页/双模型超分辨率/路径可配/自动清理", "2.0.1", "")
+# ---------------- 下载进度日志（jmcomic 生命周期插件）----------------
+# jmcomic 下载器在 before_photo/after_image/after_photo/after_album 等生命周期点，
+# 按注册表构建插件实例并调用 invoke()，事件类型由挂载的分组决定（每次全新实例，
+# 实例属性无法跨事件累计），因此计数状态统一放在模块级字典，按章节 photo_id 维护。
+# 日志走 AstrBot logger（WebUI 日志页/控制台可见），不发送 QQ 消息。
+_DL_PROGRESS_LOCK = threading.Lock()
+_DL_PROGRESS_STATE: dict[str, dict] = {}  # photo_id -> {album_id, total, done}
+
+
+def _jm_display_id(entity_id) -> str:
+    s = str(entity_id)
+    return s if s.upper().startswith("JM") else f"JM{s}"
+
+
+class _JMBotProgBeforePhoto(JmOptionPlugin):
+    plugin_key = "jmbot_prog_before_photo"
+
+    def invoke(self, photo=None, **_):
+        if photo is None:
+            return
+        with _DL_PROGRESS_LOCK:
+            _DL_PROGRESS_STATE[str(photo.id)] = {
+                "album_id": str(photo.from_album.id),
+                "total": len(photo),
+                "done": 0,
+            }
+        logger.info(
+            f"下载开始：本子-{_jm_display_id(photo.from_album.id)} "
+            f"章节-{_jm_display_id(photo.id)}，共 {len(photo)} 张"
+        )
+
+
+class _JMBotProgAfterImage(JmOptionPlugin):
+    plugin_key = "jmbot_prog_after_image"
+
+    def invoke(self, image=None, **_):
+        if image is None:
+            return
+        photo_id = str(image.from_photo.id)
+        with _DL_PROGRESS_LOCK:
+            state = _DL_PROGRESS_STATE.get(photo_id)
+            if state is None:
+                return
+            state["done"] += 1
+            done, total, album_id = state["done"], state["total"], state["album_id"]
+        logger.info(
+            f"下载进度：本子-{_jm_display_id(album_id)} "
+            f"章节-{_jm_display_id(photo_id)} {done}/{total}（{image.filename}）"
+        )
+
+
+class _JMBotProgAfterPhoto(JmOptionPlugin):
+    plugin_key = "jmbot_prog_after_photo"
+
+    def invoke(self, photo=None, **_):
+        if photo is None:
+            return
+        photo_id = str(photo.id)
+        with _DL_PROGRESS_LOCK:
+            state = _DL_PROGRESS_STATE.pop(photo_id, None)
+        if state is None:
+            return
+        done, total = state["done"], state["total"]
+        mark = "完成" if done >= total else "结束（部分图片失败）"
+        logger.info(
+            f"下载{mark}：本子-{_jm_display_id(state['album_id'])} "
+            f"章节-{_jm_display_id(photo_id)}，图片 {done}/{total}"
+        )
+
+
+class _JMBotProgAfterAlbum(JmOptionPlugin):
+    plugin_key = "jmbot_prog_after_album"
+
+    def invoke(self, album=None, **_):
+        if album is None:
+            return
+        logger.info(f"下载完成：本子-{_jm_display_id(album.id)}（共 {len(album)} 章）")
+
+
+def _register_jm_progress_plugins() -> None:
+    """把进度日志插件注册进 jmcomic 注册表（按 plugin_key 覆盖，幂等）。"""
+    for cls in (
+        _JMBotProgBeforePhoto,
+        _JMBotProgAfterImage,
+        _JMBotProgAfterPhoto,
+        _JMBotProgAfterAlbum,
+    ):
+        jmcomic.JmModuleConfig.register_plugin(cls)
+
+
+@register("astrbot_plugin_jmbot", "Sanshui755", "禁漫下载插件，批量下载/搜索翻页/双模型超分辨率/路径可配/自动清理", "2.1.0", "")
 class JMBot(Star):
     """JMBot 插件"""
 
@@ -239,7 +334,7 @@ class JMBot(Star):
         self._background_tasks.add(cleanup_task)
         cleanup_task.add_done_callback(self._background_tasks.discard)
 
-        logger.info("JMBot v2.0.1 已加载（指令消息已隔离：屏蔽默认 LLM 与陪伴/记忆插件）")
+        logger.info("JMBot v2.1.0 已加载（指令消息已隔离：屏蔽默认 LLM 与陪伴/记忆插件）")
         logger.info(f"JMBot 插件超管: {self.super_user or '(未配置)'}")
         logger.info(f"JMBot 下载目录: {self.download_root}")
 
@@ -315,6 +410,19 @@ class JMBot(Star):
         text = text.replace("pdf_dir: pdf", f"pdf_dir: {pdf_dir}")
         self.jm_config_path.write_text(text, encoding="utf-8")
         self.jm_option = jmcomic.JmOption.from_file(str(self.jm_config_path))
+        # 挂载下载进度日志插件（输出到 AstrBot 日志，不影响 QQ 消息）
+        _register_jm_progress_plugins()
+        for _group, _key in (
+            ("before_photo", _JMBotProgBeforePhoto.plugin_key),
+            ("after_image", _JMBotProgAfterImage.plugin_key),
+            ("after_photo", _JMBotProgAfterPhoto.plugin_key),
+            ("after_album", _JMBotProgAfterAlbum.plugin_key),
+        ):
+            _plist = self.jm_option.plugins.src_dict.setdefault(_group, [])
+            if not any(
+                isinstance(_p, dict) and _p.get("plugin") == _key for _p in _plist
+            ):
+                _plist.append({"plugin": _key})
         # 三个产物文件夹统一在下载路径下自动创建
         (self.download_root / "encrypt_pdf").mkdir(parents=True, exist_ok=True)
 
@@ -471,11 +579,15 @@ class JMBot(Star):
 
         for aid in album_ids:
             try:
-                file_path = await self._fetch_pdf(aid, super_model=super_model)
+                file_path, sr_notice = await self._fetch_pdf(
+                    aid, super_model=super_model
+                )
                 # 群聊按配置加密；私聊不加密
                 if is_group and self.pdf_encrypt:
                     file_path = await self._encrypt_pdf(aid, file_path)
                 yield event.chain_result([File(file=file_path, name=f"{aid}.pdf")])
+                if sr_notice:
+                    yield event.plain_result(sr_notice)
                 succeeded.append(aid)
             except Exception as e:
                 logger.exception(f"/jm 下载本子 {aid} 失败: {e}")
@@ -775,10 +887,14 @@ class JMBot(Star):
         failed: list[tuple[str, str]] = []
         for aid in album_ids:
             try:
-                file_path = await self._fetch_pdf(aid, super_model=super_model)
+                file_path, sr_notice = await self._fetch_pdf(
+                    aid, super_model=super_model
+                )
                 if is_group and self.pdf_encrypt:
                     file_path = await self._encrypt_pdf(aid, file_path)
                 yield event.chain_result([File(file=file_path, name=f"{aid}.pdf")])
+                if sr_notice:
+                    yield event.plain_result(sr_notice)
                 succeeded.append(aid)
             except Exception as e:
                 logger.exception(f"/jm(无空格) 下载本子 {aid} 失败: {e}")
@@ -1255,12 +1371,15 @@ class JMBot(Star):
         lines.append(f"需要下载请发送：/jm {detail.album_id}")
         return "\n".join(lines)
 
-    async def _fetch_pdf(self, album_id: str, super_model: str | None = None) -> str:
-        """下载相册并生成 PDF，返回 PDF 绝对路径。
+    async def _fetch_pdf(
+        self, album_id: str, super_model: str | None = None
+    ) -> tuple[str, str | None]:
+        """下载相册并生成 PDF，返回 (PDF 绝对路径, 降级提示或 None)。
 
         super_model 为 None 时走普通下载（jmcomic 的 img2pdf 插件自动合并）；
         为 ``"realesrgan"`` 或 ``"waifu2x"`` 时：禁用 img2pdf 插件 → 下载原图 →
-        对应工具超分辨率 → 手动 img2pdf。
+        对应工具超分辨率 → 手动 img2pdf。超分过程有图片回退原图时，
+        降级提示为非 None 的说明文本，由调用方在发送 PDF 后展示给用户。
         """
         await self._ensure_jm_login()
 
@@ -1272,12 +1391,17 @@ class JMBot(Star):
             pdf_path = self.download_root / "pdf" / f"{album_id}.pdf"
             if not pdf_path.exists():
                 raise FileNotFoundError(f"未找到生成的 PDF: {pdf_path}")
-            return str(pdf_path.resolve())
+            return str(pdf_path.resolve()), None
 
         return await self._fetch_pdf_super_res(album_id, super_model)
 
-    async def _fetch_pdf_super_res(self, album_id: str, model: str) -> str:
-        """超分辨率下载：下载原图 → ncnn-vulkan 工具放大 → 手动 img2pdf 生成 PDF。"""
+    async def _fetch_pdf_super_res(
+        self, album_id: str, model: str
+    ) -> tuple[str, str | None]:
+        """超分辨率下载：下载原图 → ncnn-vulkan 工具逐张放大 → 手动 img2pdf。
+
+        返回 (PDF 绝对路径, 降级提示或 None)。
+        """
         cfg = SUPERRES_TOOLS[model]
         label = cfg["label"]
 
@@ -1285,7 +1409,11 @@ class JMBot(Star):
         exe_path = await self._ensure_superres_binary(model)
         if exe_path is None:
             logger.warning(f"{label} 二进制不可用，回退到普通下载")
-            return await self._fetch_pdf(album_id, super_model=None)
+            pdf_path, _ = await self._fetch_pdf(album_id, super_model=None)
+            return (
+                pdf_path,
+                f"⚠ {label} 二进制不可用，本次已回退普通下载（无超分）",
+            )
 
         async with self._super_res_lock:
             # Step 2: 临时禁用 img2pdf 插件，下载原图
@@ -1310,13 +1438,30 @@ class JMBot(Star):
             if not image_paths:
                 raise FileNotFoundError(f"下载完成但未找到图片文件: {album_id}")
 
-            # Step 3: 运行超分工具（按 photo 目录分组）
+            # Step 3: 运行超分工具（逐张处理）
             # 输出统一放到 stock/_hr_<模型>/ 下，保留 <本子>/<章节> 层级，
             # Real-ESRGAN 与 waifu2x 各自独立顶层文件夹，互不覆盖。
+            # 逐张调用而非整章一次调用：单张崩溃/超时只损失该张（回退原图），
+            # 已生成的输出直接复用，重跑即可断点续跑。
             stock_root = self.download_root / "stock"
             hr_model_root = stock_root / f"_hr_{model}"
             input_dirs = sorted(set(Path(p).parent for p in image_paths))
             hr_image_paths: list[str] = []
+            degraded = 0  # 超分失败、回退原图的张数
+
+            def _run_one(cmd: list[str]) -> None:
+                import subprocess
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=SUPERRES_PER_IMAGE_TIMEOUT,
+                )
+                if proc.returncode != 0:
+                    raise RuntimeError(
+                        f"returncode={proc.returncode}: "
+                        f"{proc.stderr[:300] if proc.stderr else '无错误输出'}"
+                    )
 
             for img_dir in input_dirs:
                 try:
@@ -1326,42 +1471,53 @@ class JMBot(Star):
                 hr_dir = hr_model_root / rel
                 hr_dir.mkdir(parents=True, exist_ok=True)
 
-                cmd = [
-                    str(exe_path),
-                    "-i", str(img_dir),
-                    "-o", str(hr_dir),
-                    *cfg["args"],
-                    "-f", SUPERRES_FORMAT,
-                ]
-                logger.info(f"{label} 处理目录: {img_dir} -> {hr_dir}")
+                chapter_images = sorted(
+                    Path(p) for p in image_paths if Path(p).parent == img_dir
+                )
+                total_imgs = len(chapter_images)
+                logger.info(
+                    f"{label} 逐张处理: {img_dir} -> {hr_dir}"
+                    f"（共 {total_imgs} 张，单张超时 "
+                    f"{SUPERRES_PER_IMAGE_TIMEOUT}s）"
+                )
 
-                def _run_binary(cmd=cmd, label=label):
-                    import subprocess
-                    proc = subprocess.run(
-                        cmd,
-                        capture_output=True,
-                        text=True,
-                        timeout=600,
-                    )
-                    if proc.returncode != 0:
-                        raise RuntimeError(
-                            f"{label} 执行失败(returncode={proc.returncode}): "
-                            f"{proc.stderr[:500] if proc.stderr else '无错误输出'}"
+                ok_map: dict[Path, Path] = {}
+                for idx, img_path in enumerate(chapter_images, 1):
+                    out_path = hr_dir / f"{img_path.stem}.{SUPERRES_FORMAT}"
+                    if out_path.exists():
+                        # 断点续跑：已有输出直接复用（含上次中断留下的成果）
+                        ok_map[img_path] = out_path
+                        continue
+                    cmd = [
+                        str(exe_path),
+                        "-i", str(img_path),
+                        "-o", str(out_path),
+                        *cfg["args"],
+                        "-f", SUPERRES_FORMAT,
+                    ]
+                    try:
+                        await asyncio.to_thread(_run_one, cmd)
+                        ok_map[img_path] = out_path
+                        logger.info(
+                            f"{label} 超分进度 {idx}/{total_imgs}"
+                            f"（{idx * 100 // total_imgs}%）：{img_path.name}"
                         )
-                    return proc
+                    except Exception as e:
+                        degraded += 1
+                        logger.warning(
+                            f"{label} 第 {idx}/{len(chapter_images)} 张超分失败，"
+                            f"回退原图 {img_path.name}: {e}"
+                        )
+                # 按原始页序组装：成功的用超分图，失败的该张回退原图
+                hr_image_paths.extend(
+                    str(ok_map.get(img_path, img_path))
+                    for img_path in chapter_images
+                )
 
-                try:
-                    await asyncio.to_thread(_run_binary)
-                except Exception as e:
-                    logger.exception(f"{label} 处理 {img_dir} 失败: {e}")
-                    # 该章超分失败：回退使用原图，保证整本能正常出 PDF
-                    hr_image_paths.extend(
-                        str(p) for p in image_paths if Path(p).parent == img_dir
-                    )
-                    continue
-
-                hr_images = sorted(hr_dir.glob(f"*.{SUPERRES_FORMAT}"))
-                hr_image_paths.extend(str(p) for p in hr_images)
+            logger.info(
+                f"{label} 超分完成 {album_id}: 成功 "
+                f"{len(image_paths) - degraded} 张，回退原图 {degraded} 张"
+            )
 
             if not hr_image_paths:
                 raise FileNotFoundError(f"超分辨率处理未产生输出图片: {album_id}")
@@ -1379,7 +1535,14 @@ class JMBot(Star):
 
             if not pdf_path.exists():
                 raise FileNotFoundError(f"超分辨率 PDF 生成失败: {pdf_path}")
-            return str(pdf_path.resolve())
+
+            notice = None
+            if degraded:
+                notice = (
+                    f"⚠ {label} 超分有 {degraded}/{len(image_paths)} 张处理失败，"
+                    "这些页已用原图补齐，PDF 画质未完全提升"
+                )
+            return str(pdf_path.resolve()), notice
 
     async def _ensure_superres_binary(self, model: str):
         """确保指定超分工具的二进制存在，不存在则自动下载解压。
