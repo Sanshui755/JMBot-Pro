@@ -179,6 +179,18 @@ def _jm_display_id(entity_id) -> str:
     return s if s.upper().startswith("JM") else f"JM{s}"
 
 
+class _JMBotProgBeforeAlbum(JmOptionPlugin):
+    plugin_key = "jmbot_prog_before_album"
+
+    def invoke(self, album=None, **_):
+        if album is None:
+            return
+        # 专辑详情一到手立即登记标题与章节数：
+        # 总张数要等各章节详情拉取完（before_photo）才可知，此阶段进度页先显示「准备中」
+        title = (getattr(album, "title", "") or getattr(album, "name", "") or "").strip()
+        _task_album_meta(str(album.id), title=title, chapters_total=len(album))
+
+
 class _JMBotProgBeforePhoto(JmOptionPlugin):
     plugin_key = "jmbot_prog_before_photo"
 
@@ -195,6 +207,7 @@ class _JMBotProgBeforePhoto(JmOptionPlugin):
             f"下载开始：本子-{_jm_display_id(photo.from_album.id)} "
             f"章节-{_jm_display_id(photo.id)}，共 {len(photo)} 张"
         )
+        _task_chapter_begin(str(photo.from_album.id), str(photo.id), len(photo))
 
 
 class _JMBotProgAfterImage(JmOptionPlugin):
@@ -214,6 +227,7 @@ class _JMBotProgAfterImage(JmOptionPlugin):
             f"下载进度：本子-{_jm_display_id(album_id)} "
             f"章节-{_jm_display_id(photo_id)} {done}/{total}（{image.filename}）"
         )
+        _task_image_done(album_id, photo_id)
 
 
 class _JMBotProgAfterPhoto(JmOptionPlugin):
@@ -242,11 +256,15 @@ class _JMBotProgAfterAlbum(JmOptionPlugin):
         if album is None:
             return
         logger.info(f"下载完成：本子-{_jm_display_id(album.id)}（共 {len(album)} 章）")
+        title = (getattr(album, "title", "") or "").strip()
+        if title:
+            _task_update_by_album(str(album.id), title=title)
 
 
 def _register_jm_progress_plugins() -> None:
     """把进度日志插件注册进 jmcomic 注册表（按 plugin_key 覆盖，幂等）。"""
     for cls in (
+        _JMBotProgBeforeAlbum,
         _JMBotProgBeforePhoto,
         _JMBotProgAfterImage,
         _JMBotProgAfterPhoto,
@@ -255,7 +273,219 @@ def _register_jm_progress_plugins() -> None:
         jmcomic.JmModuleConfig.register_plugin(cls)
 
 
-@register("astrbot_plugin_jmbot", "Sanshui755", "禁漫下载插件，批量下载/搜索翻页/双模型超分辨率/路径可配/自动清理", "2.1.0", "")
+# ---------------- WebUI 实时进度（任务注册表）----------------
+# 每个车号的下载 = 一个任务。命令入口创建登记，jmcomic 生命周期钩子 /
+# 超分逐张循环 / PDF 渲染各阶段更新，经 register_web_api("progress") 暴露
+# 只读端点，供插件进度页（pages/progress/，AstrBot 4.x 插件页面约定目录）每 1 秒轮询渲染。
+# 钩子在工作线程触发，故统一用 threading.Lock 保护。
+_WEBUI_TASKS: dict[str, dict] = {}             # task_id -> 任务状态
+_WEBUI_TASKS_LOCK = threading.Lock()
+_WEBUI_ALBUM_INDEX: dict[str, set[str]] = {}   # album_id -> 引用该专辑的活跃 task_id
+_WEBUI_DONE_TTL_SECONDS = 60                   # 已完成任务在主列表的保留秒数（到期自动移出）
+_WEBUI_TASK_MAX = 50                           # 注册表上限（超出淘汰最旧已完成项）
+_WEBUI_HISTORY_MAX = 100                       # 历史记录条数上限（超出淘汰最旧）
+_WEBUI_HISTORY: list[dict] = []                # 已完成任务历史（含失败，新在前）
+
+
+def _task_remove_locked(task_id: str) -> None:
+    """删除任务并解除专辑索引（调用方须已持有 _WEBUI_TASKS_LOCK）。"""
+    t = _WEBUI_TASKS.pop(task_id, None)
+    if t is None:
+        return
+    ids = _WEBUI_ALBUM_INDEX.get(t["album_id"])
+    if ids is not None:
+        ids.discard(task_id)
+        if not ids:
+            _WEBUI_ALBUM_INDEX.pop(t["album_id"], None)
+
+
+def _task_prune_locked(now: float) -> None:
+    """清理过期/超额的已完成任务（调用方须已持有 _WEBUI_TASKS_LOCK）。"""
+    stale = [
+        tid
+        for tid, t in _WEBUI_TASKS.items()
+        if t["finished_at"] is not None
+        and now - t["finished_at"] > _WEBUI_DONE_TTL_SECONDS
+    ]
+    for tid in stale:
+        _task_remove_locked(tid)
+    finished = sorted(
+        (tid for tid, t in _WEBUI_TASKS.items() if t["finished_at"] is not None),
+        key=lambda tid: _WEBUI_TASKS[tid]["finished_at"],
+    )
+    while len(_WEBUI_TASKS) > _WEBUI_TASK_MAX and finished:
+        _task_remove_locked(finished.pop(0))
+
+
+def _task_begin(album_id: str, user: str, flags: str, queued: bool = False) -> str:
+    """登记新任务，返回 task_id。
+
+    queued=True 时登记为「排队中」占位（批量下载入口预登记全部车号），
+    实际开始下载时由 _task_mark_running 激活。
+    """
+    task_id = f"{album_id}-{int(time.time() * 1000)}"
+    now = time.time()
+    with _WEBUI_TASKS_LOCK:
+        _task_prune_locked(now)
+        _WEBUI_TASKS[task_id] = {
+            "task_id": task_id,
+            "album_id": album_id,
+            "title": "",
+            "user": user,
+            "flags": flags,
+            "phase": "queued" if queued else "downloading",
+            "done_imgs": 0,
+            "total_imgs": 0,
+            "chapters": [],
+            "chapters_total": 0,
+            "sr_done": 0,
+            "sr_total": 0,
+            "sr_failed": 0,
+            "sr_model": "",
+            "pdf_size_mb": 0.0,
+            "message": "",
+            "started_at": now,
+            "updated_at": now,
+            "finished_at": None,
+        }
+        _WEBUI_ALBUM_INDEX.setdefault(album_id, set()).add(task_id)
+    return task_id
+
+
+def _task_mark_running(task_id: str) -> None:
+    """排队任务真正开始下载：phase→downloading，started_at 重置为当前时刻。"""
+    now = time.time()
+    with _WEBUI_TASKS_LOCK:
+        t = _WEBUI_TASKS.get(task_id)
+        if t is not None and t["finished_at"] is None:
+            t["phase"] = "downloading"
+            t["started_at"] = now
+            t["updated_at"] = now
+
+
+def _task_update(task_id: str, **fields) -> None:
+    """按 task_id 更新任务字段。"""
+    now = time.time()
+    with _WEBUI_TASKS_LOCK:
+        t = _WEBUI_TASKS.get(task_id)
+        if t is not None:
+            t.update(fields)
+            t["updated_at"] = now
+
+
+def _task_finish(task_id: str, phase: str, **fields) -> None:
+    """任务收尾：写终态并从活跃索引移除。"""
+    now = time.time()
+    with _WEBUI_TASKS_LOCK:
+        t = _WEBUI_TASKS.get(task_id)
+        if t is None:
+            return
+        t.update(fields)
+        t["phase"] = phase
+        t["updated_at"] = now
+        t["finished_at"] = now
+        ids = _WEBUI_ALBUM_INDEX.get(t["album_id"])
+        if ids is not None:
+            ids.discard(task_id)
+            if not ids:
+                _WEBUI_ALBUM_INDEX.pop(t["album_id"], None)
+        # 归档到历史（快照拷贝，主列表后续清理不影响）
+        snap = dict(t)
+        snap["chapters"] = [dict(c) for c in t["chapters"]]
+        _WEBUI_HISTORY.insert(0, snap)
+        del _WEBUI_HISTORY[_WEBUI_HISTORY_MAX:]
+
+
+def _task_dismiss(task_id: str) -> None:
+    """任务完成且 PDF 已成功发送：立即移出主列表（历史记录仍保留）。"""
+    with _WEBUI_TASKS_LOCK:
+        _task_remove_locked(task_id)
+
+
+def _task_update_by_album(album_id: str, **fields) -> None:
+    """按专辑号更新其全部活跃任务（下载钩子只知道专辑/章节）。"""
+    now = time.time()
+    with _WEBUI_TASKS_LOCK:
+        for tid in _WEBUI_ALBUM_INDEX.get(album_id, ()):
+            t = _WEBUI_TASKS.get(tid)
+            if t is not None:
+                t.update(fields)
+                t["updated_at"] = now
+
+
+def _task_chapter_begin(album_id: str, chapter_id: str, total: int) -> None:
+    """下载开始新章节：累计总张数并登记章节明细。"""
+    now = time.time()
+    with _WEBUI_TASKS_LOCK:
+        for tid in _WEBUI_ALBUM_INDEX.get(album_id, ()):
+            t = _WEBUI_TASKS.get(tid)
+            if t is not None:
+                t["total_imgs"] += total
+                t["chapters"].append({"id": chapter_id, "total": total, "done": 0})
+                t["updated_at"] = now
+
+
+def _task_album_meta(album_id: str, title: str, chapters_total: int) -> None:
+    """专辑详情已获取：提前写入标题与预期章节数（总张数仍按章节逐步累计）。"""
+    now = time.time()
+    with _WEBUI_TASKS_LOCK:
+        for tid in _WEBUI_ALBUM_INDEX.get(album_id, ()):
+            t = _WEBUI_TASKS.get(tid)
+            if t is not None:
+                if title and not t["title"]:
+                    t["title"] = title
+                t["chapters_total"] = chapters_total
+                t["updated_at"] = now
+
+
+def _task_image_done(album_id: str, chapter_id: str) -> None:
+    """下载完成单张：累计全局与章节计数。"""
+    now = time.time()
+    with _WEBUI_TASKS_LOCK:
+        for tid in _WEBUI_ALBUM_INDEX.get(album_id, ()):
+            t = _WEBUI_TASKS.get(tid)
+            if t is not None:
+                t["done_imgs"] += 1
+                for ch in t["chapters"]:
+                    if ch["id"] == chapter_id:
+                        ch["done"] += 1
+                        break
+                t["updated_at"] = now
+
+
+def _task_sr_bump(task_id: str, done: int = 0, failed: int = 0) -> None:
+    """超分逐张计数（含断点续跑复用的张数）。"""
+    now = time.time()
+    with _WEBUI_TASKS_LOCK:
+        t = _WEBUI_TASKS.get(task_id)
+        if t is not None:
+            t["sr_done"] += done
+            t["sr_failed"] += failed
+            t["updated_at"] = now
+
+
+def _webui_tasks_snapshot() -> dict:
+    """组装进度页数据：下载中在前、排队次之、已完成最后；另附历史记录。"""
+    now = time.time()
+    with _WEBUI_TASKS_LOCK:
+        _task_prune_locked(now)
+        active, finished = [], []
+        for t in _WEBUI_TASKS.values():
+            # 浅拷贝逐层展开，避免序列化期间被工作线程修改
+            snap = dict(t)
+            snap["chapters"] = [dict(c) for c in t["chapters"]]
+            (finished if t["finished_at"] is not None else active).append(snap)
+        # 下载中的任务排前，排队中的按登记时间倒序跟在后面
+        active.sort(key=lambda t: (t["phase"] != "queued", -t["updated_at"]))
+        finished.sort(key=lambda t: t["finished_at"], reverse=True)
+        return {
+            "tasks": active + finished,
+            "history": list(_WEBUI_HISTORY),
+            "server_time": time.time(),
+        }
+
+
+@register("astrbot_plugin_jmbot", "Sanshui755", "禁漫下载插件，批量下载/搜索翻页/双模型超分辨率/路径可配/自动清理", "2.3.0", "")
 class JMBot(Star):
     """JMBot 插件"""
 
@@ -306,6 +536,20 @@ class JMBot(Star):
         self._background_tasks.add(self._migration_task)
         self._migration_task.add_done_callback(self._background_tasks.discard)
 
+        # WebUI 进度页数据端点（插件页面经 bridge apiGet("progress") 调用，
+        # 实际路由 /api/v1/plugins/extensions/astrbot_plugin_jmbot/progress。
+        # 注意：extensions 路由按「插件名 + 注册路由」整段匹配子路径，
+        # 前端固定附加 {插件名}/ 前缀，故注册路由必须带同名前缀。）
+        try:
+            self.context.register_web_api(
+                "astrbot_plugin_jmbot/progress",
+                self._api_task_progress,
+                ["GET"],
+                "JMBot 下载/超分进度",
+            )
+        except Exception as e:  # 框架接口异常不应阻断插件加载
+            logger.warning(f"注册 WebUI 进度端点失败: {e}")
+
         self._prepare_jm_option()
         self._load_jm_account()
 
@@ -334,7 +578,7 @@ class JMBot(Star):
         self._background_tasks.add(cleanup_task)
         cleanup_task.add_done_callback(self._background_tasks.discard)
 
-        logger.info("JMBot v2.1.0 已加载（指令消息已隔离：屏蔽默认 LLM 与陪伴/记忆插件）")
+        logger.info("JMBot v2.3.0 已加载（指令消息已隔离：屏蔽默认 LLM 与陪伴/记忆插件）")
         logger.info(f"JMBot 插件超管: {self.super_user or '(未配置)'}")
         logger.info(f"JMBot 下载目录: {self.download_root}")
 
@@ -413,6 +657,7 @@ class JMBot(Star):
         # 挂载下载进度日志插件（输出到 AstrBot 日志，不影响 QQ 消息）
         _register_jm_progress_plugins()
         for _group, _key in (
+            ("before_album", _JMBotProgBeforeAlbum.plugin_key),
             ("before_photo", _JMBotProgBeforePhoto.plugin_key),
             ("after_image", _JMBotProgAfterImage.plugin_key),
             ("after_photo", _JMBotProgAfterPhoto.plugin_key),
@@ -577,10 +822,17 @@ class JMBot(Star):
         succeeded: list[str] = []
         failed: list[tuple[str, str]] = []
 
-        for aid in album_ids:
+        # 预登记全部车号为「排队中」：进度页一次性展示整批，
+        # 随循环逐个激活为下载中（失败的任务在 _fetch_pdf_tracked 内落终态）
+        queued_tasks = [
+            (aid, _task_begin(aid, user_id, super_model or "", queued=True))
+            for aid in album_ids
+        ]
+
+        for aid, task_id in queued_tasks:
             try:
-                file_path, sr_notice = await self._fetch_pdf(
-                    aid, super_model=super_model
+                file_path, sr_notice = await self._fetch_pdf_tracked(
+                    user_id, aid, super_model, task_id
                 )
                 # 群聊按配置加密；私聊不加密
                 if is_group and self.pdf_encrypt:
@@ -588,6 +840,8 @@ class JMBot(Star):
                 yield event.chain_result([File(file=file_path, name=f"{aid}.pdf")])
                 if sr_notice:
                     yield event.plain_result(sr_notice)
+                # PDF 已发出：立即移出主列表，记录归档到历史
+                _task_dismiss(task_id)
                 succeeded.append(aid)
             except Exception as e:
                 logger.exception(f"/jm 下载本子 {aid} 失败: {e}")
@@ -862,6 +1116,7 @@ class JMBot(Star):
 
         # 命中 jm 车号形态，同样禁止默认 LLM 响应
         self._claim(event)
+        user_id = str(event.get_sender_id())
 
         album_ids = self._parse_album_ids(clean_text)
         if not album_ids:
@@ -885,16 +1140,23 @@ class JMBot(Star):
 
         succeeded: list[str] = []
         failed: list[tuple[str, str]] = []
-        for aid in album_ids:
+        # 预登记全部车号为「排队中」（与 /jm 主入口一致）
+        queued_tasks = [
+            (aid, _task_begin(aid, user_id, super_model or "", queued=True))
+            for aid in album_ids
+        ]
+        for aid, task_id in queued_tasks:
             try:
-                file_path, sr_notice = await self._fetch_pdf(
-                    aid, super_model=super_model
+                file_path, sr_notice = await self._fetch_pdf_tracked(
+                    user_id, aid, super_model, task_id
                 )
                 if is_group and self.pdf_encrypt:
                     file_path = await self._encrypt_pdf(aid, file_path)
                 yield event.chain_result([File(file=file_path, name=f"{aid}.pdf")])
                 if sr_notice:
                     yield event.plain_result(sr_notice)
+                # PDF 已发出：立即移出主列表，记录归档到历史
+                _task_dismiss(task_id)
                 succeeded.append(aid)
             except Exception as e:
                 logger.exception(f"/jm(无空格) 下载本子 {aid} 失败: {e}")
@@ -1371,8 +1633,46 @@ class JMBot(Star):
         lines.append(f"需要下载请发送：/jm {detail.album_id}")
         return "\n".join(lines)
 
+    async def _api_task_progress(self):
+        """WebUI 进度页数据源（只读）。"""
+        return {"status": "ok", "data": _webui_tasks_snapshot()}
+
+    async def _fetch_pdf_tracked(
+        self,
+        user_id: str,
+        album_id: str,
+        super_model: str | None,
+        task_id: str | None = None,
+    ) -> tuple[str, str | None]:
+        """带 WebUI 进度跟踪的下载：登记任务 → 下载 → 写终态。
+
+        task_id 传入命令入口预登记的排队任务（批量场景）；为 None 时在此登记。
+        下载失败同样落终态（phase=failed）后再抛出，由调用方决定如何回复。
+        """
+        if task_id is None:
+            task_id = _task_begin(album_id, user_id, super_model or "")
+        else:
+            _task_mark_running(task_id)
+        try:
+            pdf_path, notice = await self._fetch_pdf(
+                album_id, super_model=super_model, task_id=task_id
+            )
+        except Exception as e:
+            _task_finish(task_id, "failed", message=str(e)[:200])
+            raise
+        size_mb = 0.0
+        try:
+            size_mb = round(Path(pdf_path).stat().st_size / 1048576, 1)
+        except OSError:
+            pass
+        _task_finish(task_id, "done", pdf_size_mb=size_mb, message=notice or "")
+        return pdf_path, notice
+
     async def _fetch_pdf(
-        self, album_id: str, super_model: str | None = None
+        self,
+        album_id: str,
+        super_model: str | None = None,
+        task_id: str | None = None,
     ) -> tuple[str, str | None]:
         """下载相册并生成 PDF，返回 (PDF 绝对路径, 降级提示或 None)。
 
@@ -1393,10 +1693,10 @@ class JMBot(Star):
                 raise FileNotFoundError(f"未找到生成的 PDF: {pdf_path}")
             return str(pdf_path.resolve()), None
 
-        return await self._fetch_pdf_super_res(album_id, super_model)
+        return await self._fetch_pdf_super_res(album_id, super_model, task_id)
 
     async def _fetch_pdf_super_res(
-        self, album_id: str, model: str
+        self, album_id: str, model: str, task_id: str | None = None
     ) -> tuple[str, str | None]:
         """超分辨率下载：下载原图 → ncnn-vulkan 工具逐张放大 → 手动 img2pdf。
 
@@ -1437,6 +1737,16 @@ class JMBot(Star):
 
             if not image_paths:
                 raise FileNotFoundError(f"下载完成但未找到图片文件: {album_id}")
+
+            if task_id:
+                _task_update(
+                    task_id,
+                    phase="superres",
+                    sr_model=model,
+                    sr_total=len(image_paths),
+                    sr_done=0,
+                    sr_failed=0,
+                )
 
             # Step 3: 运行超分工具（逐张处理）
             # 输出统一放到 stock/_hr_<模型>/ 下，保留 <本子>/<章节> 层级，
@@ -1487,6 +1797,8 @@ class JMBot(Star):
                     if out_path.exists():
                         # 断点续跑：已有输出直接复用（含上次中断留下的成果）
                         ok_map[img_path] = out_path
+                        if task_id:
+                            _task_sr_bump(task_id, done=1)
                         continue
                     cmd = [
                         str(exe_path),
@@ -1502,12 +1814,16 @@ class JMBot(Star):
                             f"{label} 超分进度 {idx}/{total_imgs}"
                             f"（{idx * 100 // total_imgs}%）：{img_path.name}"
                         )
+                        if task_id:
+                            _task_sr_bump(task_id, done=1)
                     except Exception as e:
                         degraded += 1
                         logger.warning(
                             f"{label} 第 {idx}/{len(chapter_images)} 张超分失败，"
                             f"回退原图 {img_path.name}: {e}"
                         )
+                        if task_id:
+                            _task_sr_bump(task_id, failed=1)
                 # 按原始页序组装：成功的用超分图，失败的该张回退原图
                 hr_image_paths.extend(
                     str(ok_map.get(img_path, img_path))
@@ -1523,6 +1839,8 @@ class JMBot(Star):
                 raise FileNotFoundError(f"超分辨率处理未产生输出图片: {album_id}")
 
             # Step 4: 手动 img2pdf 生成 PDF
+            if task_id:
+                _task_update(task_id, phase="rendering")
             pdf_path = self.download_root / "pdf" / f"{album_id}.pdf"
             pdf_path.parent.mkdir(parents=True, exist_ok=True)
 

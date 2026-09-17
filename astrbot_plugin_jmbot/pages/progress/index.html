@@ -1,0 +1,630 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>JMBot 下载进度</title>
+  <style>
+    :root {
+      --bg: #f5f6f8;
+      --card: #ffffff;
+      --text: #1f2329;
+      --muted: #8a919f;
+      --border: #e5e6eb;
+      --bar-bg: #eef0f3;
+      --blue: #3370ff;
+      --purple: #7c4dff;
+      --amber: #d97706;
+      --green: #16a34a;
+      --red: #dc2626;
+      --warn: #b45309;
+    }
+
+    html[data-theme="dark"] {
+      --bg: #17181c;
+      --card: #232429;
+      --text: #e8e9ec;
+      --muted: #8a8f99;
+      --border: #33353c;
+      --bar-bg: #2e3037;
+      --blue: #5c8dff;
+      --purple: #a78bfa;
+      --amber: #fbbf24;
+      --green: #4ade80;
+      --red: #f87171;
+      --warn: #fbbf24;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.5 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+      padding: 16px;
+      max-width: 860px;
+      margin: 0 auto;
+    }
+
+    header {
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+
+    header h1 {
+      font-size: 18px;
+    }
+
+    #status {
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    #status.off {
+      color: var(--red);
+    }
+
+    .empty {
+      color: var(--muted);
+      text-align: center;
+      padding: 48px 0;
+    }
+
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px 16px;
+      margin-bottom: 12px;
+    }
+
+    .card.finished {
+      opacity: .62;
+    }
+
+    .row1 {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .title {
+      font-weight: 600;
+      font-size: 15px;
+      flex: 1;
+      min-width: 180px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .chip {
+      font-size: 12px;
+      padding: 1px 8px;
+      border-radius: 999px;
+      color: #fff;
+      flex-shrink: 0;
+    }
+
+    .chip.queued {
+      background: #64748b;
+    }
+
+    .chip.downloading {
+      background: var(--blue);
+    }
+
+    .chip.superres {
+      background: var(--purple);
+    }
+
+    .chip.rendering {
+      background: var(--amber);
+    }
+
+    .chip.done {
+      background: var(--green);
+    }
+
+    .chip.failed {
+      background: var(--red);
+    }
+
+    .meta {
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 4px;
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .bar {
+      background: var(--bar-bg);
+      border-radius: 999px;
+      height: 10px;
+      margin-top: 10px;
+      overflow: hidden;
+    }
+
+    .bar>div {
+      height: 100%;
+      border-radius: 999px;
+      transition: width 1s linear;
+      background: var(--blue);
+      box-shadow: 0 0 8px rgba(79, 124, 255, .4);
+    }
+
+    .bar.sr>div {
+      background: var(--purple);
+      box-shadow: 0 0 8px rgba(168, 85, 247, .35);
+    }
+
+    @keyframes jmbar {
+      from {
+        background-position: 0 0;
+      }
+
+      to {
+        background-position: 24px 0;
+      }
+    }
+
+    .bar.active>div,
+    .bar.seg.active .seg>div {
+      background-image: linear-gradient(45deg, rgba(255, 255, 255, .28) 25%, transparent 25%,
+          transparent 50%, rgba(255, 255, 255, .28) 50%,
+          rgba(255, 255, 255, .28) 75%, transparent 75%);
+      background-size: 24px 24px;
+      animation: jmbar 1s linear infinite;
+    }
+
+    /* 章节明细未到位时的不确定进度：小滑块来回扫动 */
+    .bar.indet>div {
+      animation: jmbar 1s linear infinite, jmindet 1.4s ease-in-out infinite;
+    }
+
+    @keyframes jmindet {
+      from {
+        transform: translateX(-110%);
+      }
+
+      to {
+        transform: translateX(340%);
+      }
+    }
+
+    .bar.seg {
+      display: flex;
+      gap: 3px;
+      background: transparent;
+      border-radius: 4px;
+    }
+
+    .bar.seg .seg {
+      background: var(--bar-bg);
+      border-radius: 4px;
+      height: 100%;
+      overflow: hidden;
+    }
+
+    .bar.seg .seg>div {
+      height: 100%;
+      border-radius: 0;
+      background: var(--blue);
+      transition: width 1s linear;
+    }
+
+    .bar-label {
+      display: flex;
+      justify-content: space-between;
+      font-size: 12px;
+      color: var(--muted);
+      margin-top: 4px;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .msg {
+      margin-top: 8px;
+      font-size: 12.5px;
+      color: var(--warn);
+      word-break: break-all;
+    }
+
+    .msg.err {
+      color: var(--red);
+    }
+
+    #history {
+      margin-top: 22px;
+    }
+
+    #history summary {
+      cursor: pointer;
+      color: var(--muted);
+      font-size: 13px;
+      user-select: none;
+      margin-bottom: 10px;
+    }
+
+    #history .card {
+      opacity: .55;
+    }
+  </style>
+</head>
+
+<body>
+  <header>
+    <h1>JMBot 下载进度</h1><span id="status"></span>
+  </header>
+  <main id="list">
+    <div class="empty">正在连接 AstrBot……</div>
+  </main>
+  <section id="history" hidden>
+    <details>
+      <summary>历史记录（<span id="hcount">0</span>）</summary>
+      <div id="hlist"></div>
+    </details>
+  </section>
+  <script>
+    (function () {
+      "use strict";
+      var bridge = null;
+      var listEl = document.getElementById("list");
+      var statusEl = document.getElementById("status");
+      var MODEL_LABEL = { realesrgan: "Real-ESRGAN", waifu2x: "waifu2x" };
+      var PHASE = {
+        queued: ["排队中", "queued"],
+        downloading: ["下载中", "downloading"],
+        superres: ["超分中", "superres"],
+        rendering: ["生成PDF", "rendering"],
+        done: ["已完成", "done"],
+        failed: ["失败", "failed"],
+      };
+
+      function fmtSec(s) {
+        s = Math.max(0, Math.round(s));
+        if (s < 60) return s + " 秒";
+        var m = Math.floor(s / 60);
+        if (m < 60) return m + " 分 " + (s % 60) + " 秒";
+        return Math.floor(m / 60) + " 时 " + (m % 60) + " 分";
+      }
+
+      function esc(s) {
+        return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+          return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+        });
+      }
+
+      function bar(label, done, total, cls, eta) {
+        if (!(total > 0)) return "";
+        var pct = Math.min(100, Math.round((done / total) * 100));
+        return '<div class="bar ' + cls + '"><div style="width:' + pct + '%"></div></div>' +
+          '<div class="bar-label"><span>' + esc(label) + '</span><span>' +
+          done + '/' + total + '（' + pct + '%）' + (eta ? ' ' + esc(eta) : '') + '</span></div>';
+      }
+
+      // 剩余时间估算：用相邻两次轮询的完成张数差算速度，EMA 平滑
+      var prevEta = {};
+      function etaText(t, serverNow) {
+        if (!(t.total_imgs > 0) || t.finished_at != null || !t.task_id) return "";
+        var nowS = serverNow || Date.now() / 1000;
+        var cur = prevEta[t.task_id];
+        if (!cur || t.done_imgs < cur.done) cur = { eta: null, done: 0, t: 0 };
+        if (t.done_imgs > cur.done) {
+          var inst = (t.total_imgs - t.done_imgs) *
+            Math.max(nowS - cur.t, 0.2) / (t.done_imgs - cur.done);
+          cur.eta = cur.eta == null ? inst : cur.eta * 0.5 + inst * 0.5;
+        }
+        prevEta[t.task_id] = { t: nowS, done: t.done_imgs, eta: cur.eta };
+        if (cur.eta == null) return "";
+        return "· 剩余 " + fmtSec(cur.eta);
+      }
+
+      // 分段章节条：多章专辑按各章张数占比分段，段内独立填充
+      function segBar(t, serverNow) {
+        var chs = (t.chapters || []).filter(function (c) { return c.total > 0; });
+        if (chs.length < 2 || !(t.total_imgs > 0)) return "";
+        var segs = chs.map(function (c) {
+          return '<div class="seg" style="width:' + (c.total / t.total_imgs * 100).toFixed(2) + '%">' +
+            '<div style="width:' + Math.min(100, c.done / c.total * 100).toFixed(1) + '%"></div></div>';
+        }).join("");
+        return '<div class="bar seg' + (t.phase === "downloading" ? " active" : "") + '">' + segs + '</div>' +
+          '<div class="bar-label"><span>下载（' + chs.length + ' 章）</span><span>' +
+          t.done_imgs + '/' + t.total_imgs + '（' + Math.round(t.done_imgs / t.total_imgs * 100) + '%）' +
+          esc(etaText(t, serverNow)) + '</span></div>';
+      }
+
+      // 历史卡片（静态字符串）：仅历史变化时整体重建
+      function renderTask(t, serverNow, extraCls) {
+        var ph = PHASE[t.phase] || [t.phase, "downloading"];
+        var finished = t.finished_at != null;
+        var endAt = finished ? t.finished_at : serverNow;
+        var mode = t.flags ? MODEL_LABEL[t.flags] || t.flags : "普通下载";
+        var html = '<div class="card' + (extraCls ? " " + extraCls : "") +
+          (finished ? " finished" : "") + '">' +
+          '<div class="row1">' +
+          '<div class="title">' + esc(t.title || "JM" + t.album_id) + '</div>' +
+          '<span class="chip ' + ph[1] + '">' + esc(ph[0]) + '</span></div>' +
+          '<div class="meta"><span>JM' + esc(t.album_id) + '</span>' +
+          '<span>' + esc(mode) + '</span>' +
+          (t.user ? '<span>用户 ' + esc(t.user) + '</span>' : '') +
+          '<span>' + fmtSec(endAt - t.started_at) + '</span></div>' +
+          (segBar(t, serverNow) ||
+            bar("下载", t.done_imgs, t.total_imgs, "dl", etaText(t, serverNow)));
+        if (t.sr_total > 0) {
+          html += bar("超分" + (t.sr_failed ? "（" + t.sr_failed + " 张回退原图）" : ""),
+            t.sr_done, t.sr_total, "sr");
+        }
+        if (t.phase === "done" && t.pdf_size_mb > 0) {
+          html += '<div class="meta"><span>PDF ' + t.pdf_size_mb + ' MB</span></div>';
+        }
+        if (t.message) {
+          html += '<div class="msg' + (t.phase === "failed" ? " err" : "") + '">' +
+            esc(t.message) + '</div>';
+        }
+        return html + "</div>";
+      }
+
+      // —— 主列表增量渲染：卡片 DOM 只建一次，每轮仅更新宽度/文本/类名 ——
+      // （整页 innerHTML 重建会打断过渡与条纹动画，时间文本也会闪跳）
+      function el(tag, cls, parent) {
+        var e = document.createElement(tag);
+        if (cls) e.className = cls;
+        if (parent) parent.appendChild(e);
+        return e;
+      }
+
+      function buildBar(parent, label, cls) {
+        var bar = el("div", "bar " + cls, parent);
+        var fill = el("div", "", bar);
+        var lab = el("div", "bar-label", parent);
+        var left = el("span", "", lab);
+        left.textContent = label;
+        return { bar: bar, fill: fill, left: left, right: el("span", "", lab) };
+      }
+
+      function buildSegBar(parent, chs, active) {
+        var bar = el("div", "bar seg" + (active ? " active" : ""), parent);
+        var segs = [];
+        for (var i = 0; i < chs.length; i++) {
+          var s = el("div", "seg", bar);
+          segs.push({ seg: s, fill: el("div", "", s) });
+        }
+        var lab = el("div", "bar-label", parent);
+        var left = el("span", "", lab);
+        left.textContent = "下载";
+        return { bar: bar, segs: segs, left: left, right: el("span", "", lab) };
+      }
+
+      var cards = {};     // task_id -> 卡片元素引用
+      var lastOrder = "";
+      var histKey = "";
+
+      function buildCard(t) {
+        var c = { root: el("div", "card"), dlSig: null, srSig: null, dl: null, sr: null };
+        var row1 = el("div", "row1", c.root);
+        c.title = el("div", "title", row1);
+        c.chip = el("span", "chip", row1);
+        var meta = el("div", "meta", c.root);
+        el("span", "", meta).textContent = "JM" + t.album_id;
+        el("span", "", meta).textContent =
+          t.flags ? MODEL_LABEL[t.flags] || t.flags : "普通下载";
+        if (t.user) el("span", "", meta).textContent = "用户 " + t.user;
+        c.time = el("span", "", meta);
+        c.barBox = el("div", "", c.root);
+        c.srBox = el("div", "", c.root);
+        c.pdf = el("div", "meta", c.root);
+        c.pdf.hidden = true;
+        c.msg = el("div", "msg", c.root);
+        c.msg.hidden = true;
+        return c;
+      }
+
+      function paintBar(b, done, total, eta) {
+        var pct = total > 0 ? Math.min(100, done / total * 100) : 0;
+        b.fill.style.width = pct.toFixed(2) + "%";
+        b.right.textContent = total > 0
+          ? done + "/" + total + "（" + Math.round(pct) + "%）" + (eta || "")
+          : "";
+      }
+
+      function updateCard(t, serverNow) {
+        var c = cards[t.task_id];
+        var ph = PHASE[t.phase] || [t.phase, "downloading"];
+        c.title.textContent = t.title || "JM" + t.album_id;
+        c.chip.textContent = ph[0];
+        c.chip.className = "chip " + ph[1];
+        c.time.textContent =
+          fmtSec((t.finished_at != null ? t.finished_at : serverNow) - t.started_at);
+        var eta = etaText(t, serverNow);
+
+        // 下载条：多章用分段条（章节注册变化时重建一次），否则普通条
+        var chs = (t.chapters || []).filter(function (x) { return x.total > 0; });
+        var useSeg = chs.length >= 2 && t.total_imgs > 0;
+        var sig = useSeg ? "seg" + chs.length + ":" + t.total_imgs : "plain";
+        if (c.dlSig !== sig) {
+          c.barBox.innerHTML = "";
+          c.dl = useSeg ? buildSegBar(c.barBox, chs, t.phase === "downloading")
+            : buildBar(c.barBox, "下载", "dl");
+          c.dlSig = sig;
+        }
+        c.dl.bar.classList.toggle("active", t.phase === "downloading");
+        if (useSeg) {
+          c.dl.left.textContent = "下载（" + chs.length + " 章）";
+          for (var i = 0; i < chs.length; i++) {
+            c.dl.segs[i].seg.style.width = (chs[i].total / t.total_imgs * 100).toFixed(2) + "%";
+            c.dl.segs[i].fill.style.width =
+              Math.min(100, chs[i].done / chs[i].total * 100).toFixed(1) + "%";
+          }
+          c.dl.right.textContent = t.done_imgs + "/" + t.total_imgs + "（" +
+            Math.round(t.done_imgs / t.total_imgs * 100) + "%）" + eta;
+        } else {
+          var indet = t.phase === "downloading" && !(t.total_imgs > 0);
+          c.dl.bar.classList.toggle("indet", indet);
+          if (indet) {
+            // 章节明细未到位（JM 详情接口较慢）：滑块动画表示正在准备
+            c.dl.fill.style.width = "30%";
+            c.dl.left.textContent = "准备中";
+            c.dl.right.textContent = t.chapters_total > 0
+              ? "已获取专辑信息，共 " + t.chapters_total + " 章，正在获取章节明细……"
+              : "正在获取章节明细……";
+          } else {
+            paintBar(c.dl, t.done_imgs, t.total_imgs, eta);
+          }
+        }
+
+        // 超分条（仅在 sr_total 变化时重建）
+        var srSig = t.sr_total > 0 ? "sr" + t.sr_total : "";
+        if (srSig !== c.srSig) {
+          c.srBox.innerHTML = "";
+          c.sr = t.sr_total > 0 ? buildBar(c.srBox, "超分", "sr") : null;
+          c.srSig = srSig;
+        }
+        if (c.sr) {
+          c.sr.bar.classList.toggle("active", t.phase === "superres");
+          c.sr.left.textContent =
+            "超分" + (t.sr_failed ? "（" + t.sr_failed + " 张回退原图）" : "");
+          paintBar(c.sr, t.sr_done, t.sr_total);
+        }
+
+        c.pdf.hidden = !(t.phase === "done" && t.pdf_size_mb > 0);
+        if (!c.pdf.hidden) c.pdf.textContent = "PDF " + t.pdf_size_mb + " MB";
+        if (t.message) {
+          c.msg.hidden = false;
+          c.msg.textContent = t.message;
+          c.msg.className = "msg" + (t.phase === "failed" ? " err" : "");
+        } else {
+          c.msg.hidden = true;
+        }
+      }
+
+      function render(tasks, serverNow) {
+        var ids = tasks.map(function (t) { return t.task_id; });
+        if (!ids.length) {
+          if (lastOrder) {
+            listEl.innerHTML = '<div class="empty">暂无任务</div>';
+            cards = {}; prevEta = {}; lastOrder = "";
+          }
+          return;
+        }
+        var empty = listEl.querySelector(".empty");
+        if (empty) empty.remove();
+        ids.forEach(function (id) {
+          if (!cards[id]) {
+            var t0 = null;
+            tasks.forEach(function (t) { if (t.task_id === id) t0 = t; });
+            cards[id] = buildCard(t0);
+          }
+        });
+        Object.keys(cards).forEach(function (id) {
+          if (ids.indexOf(id) < 0) {
+            cards[id].root.remove();
+            delete cards[id];
+            delete prevEta[id];
+          }
+        });
+        var orderKey = ids.join(",");
+        if (orderKey !== lastOrder) {
+          var frag = document.createDocumentFragment();
+          ids.forEach(function (id) { frag.appendChild(cards[id].root); });
+          listEl.appendChild(frag);
+          lastOrder = orderKey;
+        }
+        tasks.forEach(function (t) { updateCard(t, serverNow); });
+      }
+
+      function renderHistory(items) {
+        var key = items.map(function (t) { return t.task_id + ":" + t.phase; }).join(",");
+        if (key === histKey) return;
+        histKey = key;
+        var sec = document.getElementById("history");
+        if (!items.length) { sec.hidden = true; return; }
+        sec.hidden = false;
+        document.getElementById("hcount").textContent = items.length;
+        document.getElementById("hlist").innerHTML = items.map(function (t) {
+          return renderTask(t, t.finished_at, "hist");
+        }).join("");
+      }
+
+      function setOnline(ok) {
+        statusEl.textContent = ok ? "已连接 · 每 1 秒刷新" : "无法连接 AstrBot，重试中……";
+        statusEl.className = ok ? "" : "off";
+      }
+
+      async function poll() {
+        try {
+          var res = await bridge.apiGet("progress");
+          // 父页面会把响应解开为业务数据；兼容两种包裹形态
+          var d = res && res.data && res.data.tasks ? res.data
+            : (res && res.tasks ? res
+              : { tasks: [], history: [], server_time: Date.now() / 1000 });
+          render(d.tasks, d.server_time);
+          renderHistory(d.history || []);
+          setOnline(true);
+        } catch (e) {
+          setOnline(false);
+        }
+      }
+
+      // AstrBot 把 bridge-sdk.js 注入到文档末尾（晚于本内联脚本执行），
+      // 因此不能一次性判空，需轮询等待 window.AstrBotPluginPage 挂载。
+      function waitForBridge(timeoutMs) {
+        return new Promise(function (resolve) {
+          if (window.AstrBotPluginPage) { resolve(window.AstrBotPluginPage); return; }
+          var start = Date.now();
+          var timer = setInterval(function () {
+            if (window.AstrBotPluginPage) {
+              clearInterval(timer);
+              resolve(window.AstrBotPluginPage);
+            } else if (Date.now() - start > timeoutMs) {
+              clearInterval(timer);
+              resolve(null);
+            }
+          }, 50);
+        });
+      }
+
+      function withTimeout(promise, ms) {
+        return Promise.race([
+          promise,
+          new Promise(function (_, reject) {
+            setTimeout(function () { reject(new Error("timeout")); }, ms);
+          }),
+        ]);
+      }
+
+      (async function () {
+        var b = await waitForBridge(8000);
+        if (!b) {
+          listEl.innerHTML = '<div class="empty">桥接未加载：请在 AstrBot WebUI 内打开此页</div>';
+          return;
+        }
+        bridge = b;
+        try {
+          await withTimeout(bridge.ready(), 8000);
+        } catch (e) {
+          listEl.innerHTML = '<div class="empty">桥接连接超时：请在 AstrBot WebUI 内打开此页</div>';
+          return;
+        }
+        try {
+          var ctx = bridge.getContext();
+          if (ctx && ctx.isDark) document.documentElement.setAttribute("data-theme", "dark");
+        } catch (e) { /* 主题获取失败不阻塞 */ }
+        await poll();
+        setInterval(poll, 1000);
+      })();
+    })();
+  </script>
+</body>
+
+</html>
