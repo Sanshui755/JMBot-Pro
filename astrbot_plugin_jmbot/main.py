@@ -485,7 +485,7 @@ def _webui_tasks_snapshot() -> dict:
         }
 
 
-@register("astrbot_plugin_jmbot", "Sanshui755", "禁漫下载插件，批量下载/搜索翻页/双模型超分辨率/路径可配/自动清理", "2.3.0", "")
+@register("astrbot_plugin_jmbot", "Sanshui755", "禁漫下载插件，批量下载/搜索翻页/双模型超分辨率/路径可配/自动清理", "2.3.1", "")
 class JMBot(Star):
     """JMBot 插件"""
 
@@ -525,6 +525,9 @@ class JMBot(Star):
             self.superres_exes[_model] = _dir / _cfg["exe"]
         # 超分辨率下载互斥锁（保护 img2pdf 插件临时禁用/恢复）
         self._super_res_lock = asyncio.Lock()
+        # 下载互斥锁：序列化下载避免 JM 限流与插件状态竞争，
+        # 但与 _super_res_lock 相互独立，故下一本的下载可与上一本的超分并行
+        self._download_lock = asyncio.Lock()
         # 搜索翻页会话：key=(会话ID, 用户QQ) → 会话数据
         # 群聊中每位用户各自独立，只有发起人回复 1/0 才会命中自己的会话
         self._search_sessions: dict[tuple[str, str], dict] = {}
@@ -578,7 +581,7 @@ class JMBot(Star):
         self._background_tasks.add(cleanup_task)
         cleanup_task.add_done_callback(self._background_tasks.discard)
 
-        logger.info("JMBot v2.3.0 已加载（指令消息已隔离：屏蔽默认 LLM 与陪伴/记忆插件）")
+        logger.info("JMBot v2.3.1 已加载（指令消息已隔离：屏蔽默认 LLM 与陪伴/记忆插件）")
         logger.info(f"JMBot 插件超管: {self.super_user or '(未配置)'}")
         logger.info(f"JMBot 下载目录: {self.download_root}")
 
@@ -823,28 +826,29 @@ class JMBot(Star):
         failed: list[tuple[str, str]] = []
 
         # 预登记全部车号为「排队中」：进度页一次性展示整批，
-        # 随循环逐个激活为下载中（失败的任务在 _fetch_pdf_tracked 内落终态）
+        # 随循环逐个激活为下载中（失败的任务在流水线内落终态）
         queued_tasks = [
             (aid, _task_begin(aid, user_id, super_model or "", queued=True))
             for aid in album_ids
         ]
 
-        for aid, task_id in queued_tasks:
+        async for aid, task_id, pdf_path, notice, error in \
+                self._run_download_pipeline(album_ids, super_model, queued_tasks):
+            if error:
+                failed.append((aid, self._format_download_error(aid, error)))
+                continue
             try:
-                file_path, sr_notice = await self._fetch_pdf_tracked(
-                    user_id, aid, super_model, task_id
-                )
                 # 群聊按配置加密；私聊不加密
                 if is_group and self.pdf_encrypt:
-                    file_path = await self._encrypt_pdf(aid, file_path)
-                yield event.chain_result([File(file=file_path, name=f"{aid}.pdf")])
-                if sr_notice:
-                    yield event.plain_result(sr_notice)
+                    pdf_path = await self._encrypt_pdf(aid, pdf_path)
+                yield event.chain_result([File(file=pdf_path, name=f"{aid}.pdf")])
+                if notice:
+                    yield event.plain_result(notice)
                 # PDF 已发出：立即移出主列表，记录归档到历史
                 _task_dismiss(task_id)
                 succeeded.append(aid)
             except Exception as e:
-                logger.exception(f"/jm 下载本子 {aid} 失败: {e}")
+                logger.exception(f"/jm 发送本子 {aid} 失败: {e}")
                 failed.append((aid, self._format_download_error(aid, e)))
 
         # 单个车号：保持旧行为，失败才提示，成功不打扰
@@ -1145,21 +1149,22 @@ class JMBot(Star):
             (aid, _task_begin(aid, user_id, super_model or "", queued=True))
             for aid in album_ids
         ]
-        for aid, task_id in queued_tasks:
+        async for aid, task_id, pdf_path, notice, error in \
+                self._run_download_pipeline(album_ids, super_model, queued_tasks):
+            if error:
+                failed.append((aid, self._format_download_error(aid, error)))
+                continue
             try:
-                file_path, sr_notice = await self._fetch_pdf_tracked(
-                    user_id, aid, super_model, task_id
-                )
                 if is_group and self.pdf_encrypt:
-                    file_path = await self._encrypt_pdf(aid, file_path)
-                yield event.chain_result([File(file=file_path, name=f"{aid}.pdf")])
-                if sr_notice:
-                    yield event.plain_result(sr_notice)
+                    pdf_path = await self._encrypt_pdf(aid, pdf_path)
+                yield event.chain_result([File(file=pdf_path, name=f"{aid}.pdf")])
+                if notice:
+                    yield event.plain_result(notice)
                 # PDF 已发出：立即移出主列表，记录归档到历史
                 _task_dismiss(task_id)
                 succeeded.append(aid)
             except Exception as e:
-                logger.exception(f"/jm(无空格) 下载本子 {aid} 失败: {e}")
+                logger.exception(f"/jm(无空格) 发送本子 {aid} 失败: {e}")
                 failed.append((aid, self._format_download_error(aid, e)))
 
         if total == 1:
@@ -1637,6 +1642,39 @@ class JMBot(Star):
         """WebUI 进度页数据源（只读）。"""
         return {"status": "ok", "data": _webui_tasks_snapshot()}
 
+    async def _download_album(
+        self, album_id: str, super_model: str | None
+    ) -> list[str]:
+        """下载专辑原图（下载锁内，可与其他专辑的超分/PDF生成并行）。
+
+        普通模式与超分模式统一禁用 img2pdf 插件，只下载原图，返回图片路径列表。
+        PDF 生成（普通直接合并 / 超分后合并）由调用方在下载锁外完成，
+        确保跨命令模式交替时 ``after_album`` 插件状态始终一致无竞争。
+        """
+        await self._ensure_jm_login()
+
+        async with self._download_lock:
+            original_after_album = self.jm_option.plugins.src_dict.get(
+                "after_album", []
+            )
+            image_paths: list[str] = []
+            try:
+                # 所有模式统一禁用 img2pdf：下载阶段只产生原图，
+                # PDF 合并交给后处理（_make_pdf / _super_res_and_pdf）在锁外做
+                self.jm_option.plugins.src_dict["after_album"] = []
+
+                def _download_raw():
+                    return self.jm_option.download_album(album_id)
+
+                result = await asyncio.to_thread(_download_raw)
+                image_paths = list(result.manifest.image_filepath_list)
+            finally:
+                self.jm_option.plugins.src_dict["after_album"] = original_after_album
+
+            if not image_paths:
+                raise FileNotFoundError(f"下载完成但未找到图片文件: {album_id}")
+            return image_paths
+
     async def _fetch_pdf_tracked(
         self,
         user_id: str,
@@ -1668,6 +1706,87 @@ class JMBot(Star):
         _task_finish(task_id, "done", pdf_size_mb=size_mb, message=notice or "")
         return pdf_path, notice
 
+    async def _run_download_pipeline(
+        self,
+        album_ids: list[str],
+        super_model: str | None,
+        queued_tasks: list[tuple[str, str]],
+    ):
+        """滑动流水线：下一本的下载与上一本的超分并行。
+
+        yield (aid, task_id, pdf_path|None, notice|None, error|None)。
+        - pdf_path 非 None：成功，调用方发送 PDF 后应 _task_dismiss
+        - error 非 None：失败，调用方记录失败原因
+        """
+        if not queued_tasks:
+            return
+
+        # 启动第一个专辑的下载（后台 task，不阻塞后续循环）
+        download_task = asyncio.create_task(
+            self._download_album(album_ids[0], super_model)
+        )
+
+        for i, (aid, task_id) in enumerate(queued_tasks):
+            _task_mark_running(task_id)
+            # 等待当前专辑下载完成
+            try:
+                result = await download_task
+            except Exception as e:
+                logger.exception(f"/jm 下载本子 {aid} 失败: {e}")
+                _task_finish(task_id, "failed", message=str(e)[:200])
+                # 下载失败不影响后续：启动下一本下载
+                if i + 1 < len(queued_tasks):
+                    download_task = asyncio.create_task(
+                        self._download_album(album_ids[i + 1], super_model)
+                    )
+                yield (aid, task_id, None, None, e)
+                continue
+
+            # 当前专辑下载完成 → 立即启动下一本下载（与当前超分并行）
+            if i + 1 < len(queued_tasks):
+                download_task = asyncio.create_task(
+                    self._download_album(album_ids[i + 1], super_model)
+                )
+
+            # 处理当前专辑：PDF 生成在下载锁外，可与下一本下载并行
+            try:
+                image_paths = result
+                if not super_model:
+                    # 普通模式：直接手动合并 PDF（不占下载锁/超分锁）
+                    pdf_path = await self._make_pdf(aid, image_paths)
+                    notice = None
+                else:
+                    # 超分模式：二进制可用则超分，不可用回退普通 PDF
+                    cfg = SUPERRES_TOOLS[super_model]
+                    label = cfg["label"]
+                    exe_path = await self._ensure_superres_binary(super_model)
+                    if exe_path is None:
+                        logger.warning(
+                            f"{label} 二进制不可用，回退到普通 PDF"
+                        )
+                        pdf_path = await self._make_pdf(aid, image_paths)
+                        notice = (
+                            f"⚠ {label} 二进制不可用，"
+                            "本次已回退普通下载（无超分）"
+                        )
+                    else:
+                        pdf_path, notice = await self._super_res_and_pdf(
+                            aid, super_model, image_paths, task_id
+                        )
+
+                size_mb = 0.0
+                try:
+                    size_mb = round(Path(pdf_path).stat().st_size / 1048576, 1)
+                except OSError:
+                    pass
+                _task_finish(task_id, "done", pdf_size_mb=size_mb,
+                             message=notice or "")
+                yield (aid, task_id, pdf_path, notice, None)
+            except Exception as e:
+                logger.exception(f"/jm 处理本子 {aid} 失败: {e}")
+                _task_finish(task_id, "failed", message=str(e)[:200])
+                yield (aid, task_id, None, None, e)
+
     async def _fetch_pdf(
         self,
         album_id: str,
@@ -1676,68 +1795,42 @@ class JMBot(Star):
     ) -> tuple[str, str | None]:
         """下载相册并生成 PDF，返回 (PDF 绝对路径, 降级提示或 None)。
 
-        super_model 为 None 时走普通下载（jmcomic 的 img2pdf 插件自动合并）；
-        为 ``"realesrgan"`` 或 ``"waifu2x"`` 时：禁用 img2pdf 插件 → 下载原图 →
-        对应工具超分辨率 → 手动 img2pdf。超分过程有图片回退原图时，
-        降级提示为非 None 的说明文本，由调用方在发送 PDF 后展示给用户。
+        单专辑顺序路径（非流水线）：下载原图 → 超分(可选) → PDF。
+        批量场景由 _run_download_pipeline 直接调用 _download_album 与
+        _super_res_and_pdf 实现下载/超分并行。
         """
-        await self._ensure_jm_login()
-
+        image_paths = await self._download_album(album_id, super_model)
         if not super_model:
-            def _download() -> None:
-                self.jm_option.download_album([album_id])
+            pdf_path = await self._make_pdf(album_id, image_paths)
+            return pdf_path, None
+        # 超分模式：先检查二进制是否可用
+        cfg = SUPERRES_TOOLS[super_model]
+        label = cfg["label"]
+        exe_path = await self._ensure_superres_binary(super_model)
+        if exe_path is None:
+            logger.warning(f"{label} 二进制不可用，回退到普通 PDF")
+            pdf_path = await self._make_pdf(album_id, image_paths)
+            return (
+                pdf_path,
+                f"⚠ {label} 二进制不可用，本次已回退普通下载（无超分）",
+            )
+        return await self._super_res_and_pdf(
+            album_id, super_model, image_paths, task_id
+        )
 
-            await asyncio.to_thread(_download)
-            pdf_path = self.download_root / "pdf" / f"{album_id}.pdf"
-            if not pdf_path.exists():
-                raise FileNotFoundError(f"未找到生成的 PDF: {pdf_path}")
-            return str(pdf_path.resolve()), None
-
-        return await self._fetch_pdf_super_res(album_id, super_model, task_id)
-
-    async def _fetch_pdf_super_res(
-        self, album_id: str, model: str, task_id: str | None = None
+    async def _super_res_and_pdf(
+        self, album_id: str, model: str, image_paths: list[str],
+        task_id: str | None = None,
     ) -> tuple[str, str | None]:
-        """超分辨率下载：下载原图 → ncnn-vulkan 工具逐张放大 → 手动 img2pdf。
+        """超分辨率处理 + PDF 生成（超分锁内，下载已由 _download_album 完成）。
 
         返回 (PDF 绝对路径, 降级提示或 None)。
         """
         cfg = SUPERRES_TOOLS[model]
         label = cfg["label"]
-
-        # Step 1: 确保二进制就绪
-        exe_path = await self._ensure_superres_binary(model)
-        if exe_path is None:
-            logger.warning(f"{label} 二进制不可用，回退到普通下载")
-            pdf_path, _ = await self._fetch_pdf(album_id, super_model=None)
-            return (
-                pdf_path,
-                f"⚠ {label} 二进制不可用，本次已回退普通下载（无超分）",
-            )
+        exe_path = self.superres_exes[model]  # 调用方已确认二进制可用
 
         async with self._super_res_lock:
-            # Step 2: 临时禁用 img2pdf 插件，下载原图
-            original_after_album = self.jm_option.plugins.src_dict.get(
-                "after_album", []
-            )
-            image_paths: list[str] = []
-            try:
-                self.jm_option.plugins.src_dict["after_album"] = []
-
-                def _download():
-                    return self.jm_option.download_album(album_id)
-
-                result = await asyncio.to_thread(_download)
-                image_paths = list(result.manifest.image_filepath_list)
-            except Exception as e:
-                logger.exception(f"超分辨率下载：下载原图失败 {album_id}: {e}")
-                raise
-            finally:
-                self.jm_option.plugins.src_dict["after_album"] = original_after_album
-
-            if not image_paths:
-                raise FileNotFoundError(f"下载完成但未找到图片文件: {album_id}")
-
             if task_id:
                 _task_update(
                     task_id,
@@ -1748,7 +1841,7 @@ class JMBot(Star):
                     sr_failed=0,
                 )
 
-            # Step 3: 运行超分工具（逐张处理）
+            # Step 1: 运行超分工具（逐张处理）
             # 输出统一放到 stock/_hr_<模型>/ 下，保留 <本子>/<章节> 层级，
             # Real-ESRGAN 与 waifu2x 各自独立顶层文件夹，互不覆盖。
             # 逐张调用而非整章一次调用：单张崩溃/超时只损失该张（回退原图），
@@ -1838,20 +1931,11 @@ class JMBot(Star):
             if not hr_image_paths:
                 raise FileNotFoundError(f"超分辨率处理未产生输出图片: {album_id}")
 
-            # Step 4: 手动 img2pdf 生成 PDF
+            # Step 2: 手动 img2pdf 生成 PDF
             if task_id:
                 _task_update(task_id, phase="rendering")
-            pdf_path = self.download_root / "pdf" / f"{album_id}.pdf"
-            pdf_path.parent.mkdir(parents=True, exist_ok=True)
-
-            def _make_pdf():
-                import img2pdf
-                with open(pdf_path, "wb") as f:
-                    f.write(img2pdf.convert(hr_image_paths))
-
-            await asyncio.to_thread(_make_pdf)
-
-            if not pdf_path.exists():
+            pdf_path = await self._make_pdf(album_id, hr_image_paths)
+            if not Path(pdf_path).exists():
                 raise FileNotFoundError(f"超分辨率 PDF 生成失败: {pdf_path}")
 
             notice = None
@@ -1860,7 +1944,24 @@ class JMBot(Star):
                     f"⚠ {label} 超分有 {degraded}/{len(image_paths)} 张处理失败，"
                     "这些页已用原图补齐，PDF 画质未完全提升"
                 )
-            return str(pdf_path.resolve()), notice
+            return str(pdf_path), notice
+
+    async def _make_pdf(self, album_id: str, image_paths: list[str]) -> str:
+        """手动 img2pdf 合并图片为 PDF（不占用下载锁/超分锁）。
+
+        普通下载与超分下载统一调用，确保两种模式的下载阶段都禁用 img2pdf
+        插件，跨命令模式交替时插件状态一致无竞争。
+        """
+        pdf_path = self.download_root / "pdf" / f"{album_id}.pdf"
+        pdf_path.parent.mkdir(parents=True, exist_ok=True)
+
+        def _convert() -> None:
+            import img2pdf
+            with open(pdf_path, "wb") as f:
+                f.write(img2pdf.convert(image_paths))
+
+        await asyncio.to_thread(_convert)
+        return str(pdf_path.resolve())
 
     async def _ensure_superres_binary(self, model: str):
         """确保指定超分工具的二进制存在，不存在则自动下载解压。
