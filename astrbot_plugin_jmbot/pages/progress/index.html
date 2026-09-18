@@ -511,10 +511,12 @@
       function render(tasks, serverNow) {
         var ids = tasks.map(function (t) { return t.task_id; });
         if (!ids.length) {
-          if (lastOrder) {
-            listEl.innerHTML = '<div class="empty">暂无任务</div>';
-            cards = {}; prevEta = {}; lastOrder = "";
+          // 无任务：只在空状态文案变化时写一次，避免每秒无谓重建
+          var curEmpty = listEl.querySelector(".empty");
+          if (!curEmpty || curEmpty.textContent !== "暂无下载任务") {
+            listEl.innerHTML = '<div class="empty">暂无下载任务<br><small style="opacity:.6">发送 /jm 车号 后此处会显示实时进度</small></div>';
           }
+          cards = {}; prevEta = {}; lastOrder = "";
           return;
         }
         var empty = listEl.querySelector(".empty");

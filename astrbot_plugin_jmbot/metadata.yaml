@@ -2,7 +2,7 @@ name: astrbot_plugin_jmbot
 display_name: JMBot
 desc: 禁漫下载插件，/jm 支持批量多车号，下载路径可配置（自动维护三个文件夹），产物保留3天自动清理
 short_desc: 禁漫批量下载，路径可配，自动清理
-version: 2.3.1
+version: 2.3.2
 author: Sanshui755
 repo: https://github.com/Sanshui755/JMBot-Pro
 support_platforms:
