@@ -30,8 +30,8 @@ from pathlib import Path
 
 import jmcomic
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import File, MessageChain
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.message_components import File
 from astrbot.api.star import Context, Star, register
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 from jmcomic.jm_exception import MissingAlbumPhotoException
