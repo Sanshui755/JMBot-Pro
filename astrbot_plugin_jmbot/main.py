@@ -31,7 +31,7 @@ from pathlib import Path
 import jmcomic
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import File
+from astrbot.api.message_components import File, MessageChain
 from astrbot.api.star import Context, Star, register
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 from jmcomic.jm_exception import MissingAlbumPhotoException
@@ -136,6 +136,12 @@ SUPERRES_FORMAT = "jpg"
 # 单张超分 subprocess 超时（秒）：waifu2x 在中端独显上约 20-30s/张，留足余量。
 # 逐张调用下单张卡死/崩溃只损失该张（回退原图），不再像整章超时那样损失全章。
 SUPERRES_PER_IMAGE_TIMEOUT = 240
+
+# PDF 文件发送：NapCat 偶发 retcode=1200 "rich media transfer failed"
+# （QQ 风控/富媒体缓存瞬时故障），重试往往即可成功。
+PDF_SEND_RETRIES = 3
+PDF_SEND_RETRY_DELAY = 3.0
+
 SUPERRES_TOOLS = {
     "realesrgan": {
         "dir": "realesrgan",
@@ -485,7 +491,7 @@ def _webui_tasks_snapshot() -> dict:
         }
 
 
-@register("astrbot_plugin_jmbot", "Sanshui755", "禁漫下载插件，批量下载/搜索翻页/双模型超分辨率/路径可配/自动清理", "2.3.2", "")
+@register("astrbot_plugin_jmbot", "Sanshui755", "禁漫下载插件，批量下载/搜索翻页/双模型超分辨率/路径可配/自动清理", "2.3.3", "")
 class JMBot(Star):
     """JMBot 插件"""
 
@@ -581,7 +587,7 @@ class JMBot(Star):
         self._background_tasks.add(cleanup_task)
         cleanup_task.add_done_callback(self._background_tasks.discard)
 
-        logger.info("JMBot v2.3.2 已加载（指令消息已隔离：屏蔽默认 LLM 与陪伴/记忆插件）")
+        logger.info("JMBot v2.3.3 已加载（指令消息已隔离：屏蔽默认 LLM 与陪伴/记忆插件）")
         logger.info(f"JMBot 插件超管: {self.super_user or '(未配置)'}")
         logger.info(f"JMBot 下载目录: {self.download_root}")
 
@@ -841,15 +847,26 @@ class JMBot(Star):
                 # 群聊按配置加密；私聊不加密
                 if is_group and self.pdf_encrypt:
                     pdf_path = await self._encrypt_pdf(aid, pdf_path)
-                yield event.chain_result([File(file=pdf_path, name=f"{aid}.pdf")])
+                # 直发+重试：框架 yield 发送的失败异常插件捕获不到（见方法注释）
+                sent = await self._send_pdf_with_retry(event, pdf_path, aid)
+            except Exception as e:  # 加密等本地处理失败
+                logger.exception(f"/jm 发送本子 {aid} 失败: {e}")
+                _task_finish(task_id, "failed", error=f"发送失败: {e}")
+                failed.append((aid, self._format_download_error(aid, e)))
+                continue
+            if sent:
                 if notice:
                     yield event.plain_result(notice)
                 # PDF 已发出：立即移出主列表，记录归档到历史
                 _task_dismiss(task_id)
                 succeeded.append(aid)
-            except Exception as e:
-                logger.exception(f"/jm 发送本子 {aid} 失败: {e}")
-                failed.append((aid, self._format_download_error(aid, e)))
+            else:
+                # 重试耗尽：明确告知用户 PDF 本地路径
+                _task_finish(task_id, "failed", error="QQ 文件发送失败")
+                failed.append(
+                    (aid, f"PDF 已生成但 QQ 发送失败（已重试 {PDF_SEND_RETRIES} 次），"
+                          f"文件已保留：{pdf_path}，可稍后重新发送 /jm {aid}")
+                )
 
         # 单个车号：保持旧行为，失败才提示，成功不打扰
         if total == 1:
@@ -1157,15 +1174,26 @@ class JMBot(Star):
             try:
                 if is_group and self.pdf_encrypt:
                     pdf_path = await self._encrypt_pdf(aid, pdf_path)
-                yield event.chain_result([File(file=pdf_path, name=f"{aid}.pdf")])
+                # 直发+重试：框架 yield 发送的失败异常插件捕获不到（见方法注释）
+                sent = await self._send_pdf_with_retry(event, pdf_path, aid)
+            except Exception as e:  # 加密等本地处理失败
+                logger.exception(f"/jm(无空格) 发送本子 {aid} 失败: {e}")
+                _task_finish(task_id, "failed", error=f"发送失败: {e}")
+                failed.append((aid, self._format_download_error(aid, e)))
+                continue
+            if sent:
                 if notice:
                     yield event.plain_result(notice)
                 # PDF 已发出：立即移出主列表，记录归档到历史
                 _task_dismiss(task_id)
                 succeeded.append(aid)
-            except Exception as e:
-                logger.exception(f"/jm(无空格) 发送本子 {aid} 失败: {e}")
-                failed.append((aid, self._format_download_error(aid, e)))
+            else:
+                # 重试耗尽：明确告知用户 PDF 本地路径
+                _task_finish(task_id, "failed", error="QQ 文件发送失败")
+                failed.append(
+                    (aid, f"PDF 已生成但 QQ 发送失败（已重试 {PDF_SEND_RETRIES} 次），"
+                          f"文件已保留：{pdf_path}，可稍后重新发送 /jm {aid}")
+                )
 
         if total == 1:
             if failed:
@@ -1455,6 +1483,37 @@ class JMBot(Star):
         if candidates:
             return max(candidates, key=len)
         return ""
+
+    @staticmethod
+    async def _send_pdf_with_retry(
+        event: AstrMessageEvent, pdf_path: Path, album_id: str
+    ) -> bool:
+        """直发 PDF 文件并重试，返回是否成功。
+
+        之前用 ``yield chain_result`` 把文件交给框架发送：NapCat 发送失败
+        （retcode=1200 rich media transfer failed，多为 QQ 风控/富媒体缓存
+        瞬时故障）的异常发生在框架 respond 阶段，插件内的 try/except
+        捕获不到，用户侧表现为「已开始下载」之后再无任何回复。
+        改为 ``event.send()`` 直发——失败会抛异常，可在插件内重试并
+        明确告知用户最终结果。
+        """
+        chain = MessageChain(
+            chain=[File(file=str(pdf_path), name=f"{album_id}.pdf")]
+        )
+        for attempt in range(1, PDF_SEND_RETRIES + 1):
+            try:
+                await event.send(chain)
+                if attempt > 1:
+                    logger.info(f"PDF 发送成功（第 {attempt} 次重试）: {album_id}")
+                return True
+            except Exception as e:  # noqa: BLE001 - 协议端异常类型多样
+                logger.warning(
+                    f"PDF 发送失败（第 {attempt}/{PDF_SEND_RETRIES} 次）"
+                    f"{album_id}: {e}"
+                )
+                if attempt < PDF_SEND_RETRIES:
+                    await asyncio.sleep(PDF_SEND_RETRY_DELAY)
+        return False
 
     @staticmethod
     def _format_download_error(album_id: str, e: Exception) -> str:
