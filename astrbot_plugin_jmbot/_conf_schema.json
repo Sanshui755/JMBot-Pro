@@ -25,6 +25,12 @@
         "secret": true,
         "hint": "群聊加密PDF使用的密码，私聊发送的PDF不加密。"
     },
+    "superres_enabled": {
+        "description": "超分辨率功能总开关",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后 /jm -h/-hr/-hw 指令会提示「超分已关闭」并以普通模式下载。性能较差或无独显的服务器建议关闭。"
+    },
     "superres_model": {
         "description": "超分辨率默认模型（/jm -h 使用）",
         "type": "string",

@@ -37,28 +37,128 @@ from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 from jmcomic.jm_exception import MissingAlbumPhotoException
 from jmcomic.jm_plugin import JmOptionPlugin
 
+
+def _patch_jmcomic_bom() -> None:
+    """兼容 JM 接口响应开头带 UTF-8 BOM 的问题。
+
+    2026-10 起 JM 的 /setting 等接口响应体在 ``{`` 前带了一个
+    ``\\ufeff``（EF BB BF）。jmcomic 2.7.7 的响应校验只跳过空格/换行/
+    制表符，首字符不是 ``{`` 就判定异常并重试，四个域名全部失败后抛
+    RequestRetryAllFailException，表现为登录/下载全部不可用。
+    jmcomic 自身在 req_api_domain_server 里已会剥离开头非 ASCII 字符，
+    但通用校验路径没有处理。此处统一在响应进入校验前剥离 BOM，
+    同时保证后续 json.loads 拿到的是干净文本。
+    PyPI 最新版（2.7.7）尚未修复，故在插件内热补丁，sync/async 两端口都打。
+    """
+    try:
+        from jmcomic.jm_client_impl import JmApiClient
+        from jmcomic.jm_async_client import AsyncJmApiClient
+    except Exception as e:  # noqa: BLE001 - 未来 jmcomic 结构变化时跳过补丁
+        logger.warning(f"JMBot BOM 补丁加载跳过（jmcomic 结构不兼容）: {e}")
+        return
+
+    bom_bytes = b"\xef\xbb\xbf"
+
+    def _strip_bom(resp) -> None:
+        """剥离响应正文开头的 BOM，并清除已缓存的 text 解码结果。
+
+        jmcomic 2.7.x 实际使用的 HTTP 库：
+        - curl_cffi 0.14（AsyncSession/Session，impersonate=chrome）：
+          正文是实例属性 ``resp.content``，text 缓存于 ``resp._text``
+          （以 hasattr 判断是否已解码，删掉即会按新 content 重算）
+        - requests/httpx：正文存于 ``resp._content``，text 动态解码
+        两类都处理，保证不同 jmcomic/HTTP 库版本下补丁都生效。
+        """
+        try:
+            # curl_cffi：content 为直接属性
+            content = getattr(resp, "content", None)
+            if isinstance(content, bytes) and content[:3] == bom_bytes:
+                resp.content = content[3:]
+                if hasattr(resp, "_text"):
+                    try:
+                        delattr(resp, "_text")
+                    except Exception:  # noqa: BLE001
+                        pass
+                return
+            # requests/httpx：正文存于 _content
+            content = getattr(resp, "_content", None)
+            if isinstance(content, bytes) and content[:3] == bom_bytes:
+                resp._content = content[3:]
+                if hasattr(resp, "_text"):
+                    try:
+                        delattr(resp, "_text")
+                    except Exception:  # noqa: BLE001
+                        pass
+        except Exception:  # noqa: BLE001 - JmResp 等包装对象可能只读/无正文
+            pass
+
+    # ---- 同步客户端 ----
+    if not getattr(JmApiClient.raise_if_resp_should_retry, "_jmbot_bom_patched", False):
+        _orig_sync = JmApiClient.raise_if_resp_should_retry
+
+        def _patched_sync(self, resp, is_image=False):  # noqa: ANN001
+            _strip_bom(resp)
+            return _orig_sync(self, resp, is_image)
+
+        _patched_sync._jmbot_bom_patched = True
+        JmApiClient.raise_if_resp_should_retry = _patched_sync
+
+    # ---- 异步客户端 ----
+    _orig_async = AsyncJmApiClient._raise_if_resp_should_retry
+    if not getattr(_orig_async, "_jmbot_bom_patched", False):
+
+        def _patched_async(resp):  # noqa: ANN001
+            _strip_bom(resp)
+            return _orig_async(resp)
+
+        _patched_async._jmbot_bom_patched = True
+        AsyncJmApiClient._raise_if_resp_should_retry = staticmethod(_patched_async)
+
+    logger.info("JMBot 已加载 JM 响应 BOM 兼容补丁（sync+async）")
+
+
+_patch_jmcomic_bom()
+
 from .set_password import set_password_pdf
 
 PLUGIN_DIR = Path(__file__).resolve().parent
 JM_CONFIG_TEMPLATE = PLUGIN_DIR / "config.yml"
 
-HELP_TEXT = (
-    "使用方法：\n输入 /jm+空格+id ，机器人会自动下载生成 pdf 并发送消息。\n"
-    "例： /jm 350234\n"
-    "支持批量： /jm 350234 350235（或一条消息里发多条 /jm 指令）\n"
-    "数字后加中文备注也可以，如 /jm 350234极品\n"
-    "超分辨率下载（画质提升）：\n"
-    "  /jm -h 350234 用插件配置页选择的默认模型（默认 Real-ESRGAN）\n"
-    "  /jm -hr 350234 强制用 Real-ESRGAN，/jm -hw 350234 强制用 waifu2x\n"
-    "  ⚠ 超分需逐张放大图片，耗时比普通下载明显增加（无独显时更慢），\n"
-    "    请耐心等待、勿重复发指令；首次使用会自动下载工具包\n"
-    "    （Real-ESRGAN 约45MB/waifu2x 约35MB，仅一次），PDF 体积也会变大\n"
-    "站内搜索：/jms <关键词>（如 /jms 全彩 人妻），结果回复 1 翻页/0 退出\n"
-    "按作者搜索：/jma <作者名>（如 /jma AREA188），结果回复 1 翻页/0 退出\n"
-    "只看详情不下载：/jmv 350234（可直接粘贴含车号的链接或整段文本）\n"
-    "下载的文件仅在本机保留3天，到期自动删除\n"
-    "如有pdf有密码,默认密码为114514"
-)
+def _build_help_text(default_model_label: str, superres_on: bool) -> str:
+    """根据当前超分配置动态生成 /jm help 文案。"""
+    if superres_on:
+        sr = (
+            "超分辨率下载（画质提升）：\n"
+            f"  /jm -h 350234 用插件配置页选择的默认模型（当前 {default_model_label}）\n"
+            "  /jm -hr 350234 强制用 Real-ESRGAN，/jm -hw 350234 强制用 waifu2x\n"
+            "  ⚠ 超分需逐张放大图片，耗时比普通下载明显增加（无独显时更慢），\n"
+            "    请耐心等待、勿重复发指令；首次使用会自动下载工具包\n"
+            "    （Real-ESRGAN 约45MB/waifu2x 约35MB，仅一次），PDF 体积也会变大\n"
+        )
+    else:
+        sr = (
+            "超分辨率下载：已关闭（配置页「超分辨率功能总开关」未开启）\n"
+            "  /jm -h/-hr/-hw 指令会提示超分已关闭，并以普通模式下载\n"
+        )
+    return (
+        "使用方法：\n输入 /jm+空格+id ，机器人会自动下载生成 pdf 并发送消息。\n"
+        "例： /jm 350234\n"
+        "支持批量： /jm 350234 350235（或一条消息里发多条 /jm 指令）\n"
+        "数字后加中文备注也可以，如 /jm 350234极品\n"
+        + sr +
+        "站内搜索：/jms <关键词>（如 /jms 全彩 人妻），结果回复 1 翻页/0 退出\n"
+        "按作者搜索：/jma <作者名>（如 /jma AREA188），结果回复 1 翻页/0 退出\n"
+        "只看详情不下载：/jmv 350234（可直接粘贴含车号的链接或整段文本）\n"
+        "下载的文件仅在本机保留3天，到期自动删除\n"
+        "如有pdf有密码,默认密码为114514"
+    )
+
+
+def _get_help_text(plugin: "JMBotPlugin") -> str:
+    return _build_help_text(
+        SUPERRES_TOOLS[plugin.default_superres_model]["label"],
+        plugin.superres_enabled,
+    )
 
 JMV_HELP_TEXT = (
     "本子详情查询（只看不下载）：\n"
@@ -491,7 +591,7 @@ def _webui_tasks_snapshot() -> dict:
         }
 
 
-@register("astrbot_plugin_jmbot", "Sanshui755", "禁漫下载插件，批量下载/搜索翻页/双模型超分辨率/路径可配/自动清理", "2.3.3", "")
+@register("astrbot_plugin_jmbot", "Sanshui755", "禁漫下载插件，批量下载/搜索翻页/双模型超分辨率/路径可配/自动清理", "2.3.4", "")
 class JMBot(Star):
     """JMBot 插件"""
 
@@ -587,7 +687,7 @@ class JMBot(Star):
         self._background_tasks.add(cleanup_task)
         cleanup_task.add_done_callback(self._background_tasks.discard)
 
-        logger.info("JMBot v2.3.3 已加载（指令消息已隔离：屏蔽默认 LLM 与陪伴/记忆插件）")
+        logger.info("JMBot v2.3.4 已加载（指令消息已隔离：屏蔽默认 LLM 与陪伴/记忆插件）")
         logger.info(f"JMBot 插件超管: {self.super_user or '(未配置)'}")
         logger.info(f"JMBot 下载目录: {self.download_root}")
 
@@ -631,6 +731,11 @@ class JMBot(Star):
     def pdf_password(self, value: str) -> None:
         self.config["pdf_password"] = value
         self._save_config()
+
+    @property
+    def superres_enabled(self) -> bool:
+        """超分辨率功能总开关（配置页可关闭，性能差的服务器可禁用）。"""
+        return bool(self.config.get("superres_enabled", True))
 
     @property
     def default_superres_model(self) -> str:
@@ -810,10 +915,18 @@ class JMBot(Star):
         if super_model == "default":
             super_model = self.default_superres_model
 
+        # 超分总开关关闭：提示用户并回退普通下载
+        if super_model and not self.superres_enabled:
+            yield event.plain_result(
+                "⚠ 超分辨率功能已关闭（配置页「超分辨率功能总开关」未开启），"
+                "本次将以普通模式下载。"
+            )
+            super_model = None
+
         # 从消息原文解析全部车号（/jm a b、多条 /jm、数字后带中文备注均支持）
         album_ids = self._parse_album_ids(clean_text)
         if not album_ids:
-            yield event.plain_result(HELP_TEXT)
+            yield event.plain_result(_get_help_text(self))
             return
 
         total = len(album_ids)
@@ -1134,6 +1247,14 @@ class JMBot(Star):
 
         if not re.match(r"/?jm\d+", clean_text, re.IGNORECASE):
             return
+
+        # 超分总开关关闭：提示用户并回退普通下载
+        if super_model and not self.superres_enabled:
+            yield event.plain_result(
+                "⚠ 超分辨率功能已关闭（配置页「超分辨率功能总开关」未开启），"
+                "本次将以普通模式下载。"
+            )
+            super_model = None
 
         # 命中 jm 车号形态，同样禁止默认 LLM 响应
         self._claim(event)
