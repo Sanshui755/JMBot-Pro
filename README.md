@@ -14,14 +14,13 @@
 
 #### 项目结构
 
-两个实现相互独立、命令与行为保持一致，核心下载能力均来自 [`jmcomic`](https://github.com/hect0x7/JMComic-Crawler-Python) 库：
+本仓库为 AstrBot 插件形态，核心下载能力来自 [`jmcomic`](https://github.com/hect0x7/JMComic-Crawler-Python) 库：
 
-| 目录                    | 框架                             | 入口                                            |
-| ----------------------- | -------------------------------- | ----------------------------------------------- |
-| `astrbot_plugin_jmbot/` | AstrBot 插件（主版本，功能最全） | `main.py`，配置定义 `_conf_schema.json`         |
-| `JMBot_v5/`             | NcatBot 独立机器人               | `plugins/JMBot/plugin.py`，清单 `manifest.toml` |
+| 目录                    | 框架         | 入口                                    |
+| ----------------------- | ------------ | --------------------------------------- |
+| `astrbot_plugin_jmbot/` | AstrBot 插件 | `main.py`，配置定义 `_conf_schema.json` |
 
-公共逻辑（PDF 加密）分别由各自目录下的 `set_password.py` 提供，目前未抽成共享包，改动需两边同步。
+> 另有不依赖 AstrBot 的 NcatBot 独立机器人部署形态，已拆分至姊妹仓库 **[Sanshui755/JMBot-NcatBot](https://github.com/Sanshui755/JMBot-NcatBot)**。
 
 #### 本地开发
 
@@ -45,14 +44,9 @@
 
 基于 QQ 机器人框架的禁漫（JM Comic）下载插件：在群聊或私聊中发送漫画 ID，机器人即自动完成下载、生成 PDF 并回传文件。支持批量下载、JM 账号登录、PDF 加密、下载路径自定义与产物定期清理。
 
-本项目提供两种相互独立的部署方式，**推荐使用方法一（NapCat + AstrBot 插件）**——自带 WebUI 可视化配置，Python 依赖自动安装，部署最简单：
+本项目以 **AstrBot 插件**形态交付（NapCat + AstrBot），自带 WebUI 可视化配置，Python 依赖自动安装，部署最简单。
 
-| 方式                                                                             | 目录                                             | 适用场景                                        |
-| -------------------------------------------------------------------------------- | ------------------------------------------------ | ----------------------------------------------- |
-| ⭐ [方法一：NapCat + AstrBot 插件（推荐）](#方法一napcat--astrbot-插件推荐)       | [`astrbot_plugin_jmbot/`](astrbot_plugin_jmbot/) | 绝大多数用户：上传 zip 即可使用，WebUI 配置     |
-| [方法二：NapCat + NcatBot 插件（JMBot_v5）](#方法二napcat--ncatbot-插件jmbot_v5) | [`JMBot_v5/`](JMBot_v5/)                         | 希望运行一个独立、轻量、不依赖 AstrBot 的机器人 |
-
-两种方式功能完全一致，可根据自己已有的机器人环境选择，无需都装。
+> 另有不依赖 AstrBot 的 **NcatBot 独立机器人**部署形态（适合想运行一个独立、轻量机器人的用户），已拆分至姊妹仓库：**[Sanshui755/JMBot-NcatBot](https://github.com/Sanshui755/JMBot-NcatBot)**。
 
 ---
 
@@ -82,9 +76,9 @@
 - **[hect0x7/JMComic-Crawler-Python](https://github.com/hect0x7/JMComic-Crawler-Python)**（[MIT License](https://github.com/hect0x7/JMComic-Crawler-Python/blob/master/LICENSE)）—— 提供禁漫站点访问、域名解析、图片混淆还原、账号登录等全部核心下载能力。JMBot-Pro 仅是该库的上层应用，没有它本项目无法成立。
 - [Sora-o-tobu/JM-NcatBot](https://github.com/Sora-o-tobu/JM-NcatBot) —— Estecsky/JMBot 的上游项目，本项目的衍生脉络为：
   `JM-NcatBot` → `Estecsky/JMBot` → **JMBot-Pro（本项目）**
-- [AstrBot](https://github.com/AstrBotDevs/AstrBot) —— 方法一所使用的多平台 LLM 聊天机器人框架（推荐）
+- [AstrBot](https://github.com/AstrBotDevs/AstrBot) —— 本项目使用的多平台 LLM 聊天机器人框架
 - [NapCatQQ](https://napcat.napneko.icu/) —— QQ 协议端
-- [NcatBot](https://docs.ncatbot.xyz/) —— 方法二所使用的 Python 机器人框架
+- [NcatBot](https://docs.ncatbot.xyz/) —— 姊妹仓库 [JMBot-NcatBot](https://github.com/Sanshui755/JMBot-NcatBot) 所使用的 Python 机器人框架
 
 > **许可说明**：[Estecsky/JMBot](https://github.com/Estecsky/JMBot) 与 Sora-o-tobu/JM-NcatBot 未在其仓库中声明开源许可证。本项目在充分署名的前提下发布衍生代码，若相关权利人对改编或发布有异议，请随时联系，将第一时间配合处理。
 
@@ -119,7 +113,7 @@
 
 ---
 
-## 方法一：NapCat + AstrBot 插件（推荐）
+## 安装与使用（NapCat + AstrBot 插件）
 
 架构链路：**QQ ← NapCat（QQ 协议端）← aiocqhttp → AstrBot（机器人框架）← 插件 → JMBot**。
 
@@ -157,81 +151,11 @@ JM状态
 
 ---
 
-## 方法二：NapCat + NcatBot 插件（JMBot_v5）
+## 其他部署方式：NcatBot 独立版
 
-适合希望运行**独立机器人**、不依赖 AstrBot 的用户。架构链路：**NapCat（QQ 协议端）← WebSocket → NcatBot（Python 框架）← 插件 → JMBot**。
+如果你希望运行一个**独立、轻量、不依赖 AstrBot** 的机器人（NapCat + NcatBot 架构），请使用姊妹仓库 **[Sanshui755/JMBot-NcatBot](https://github.com/Sanshui755/JMBot-NcatBot)**，其中包含独立的安装与配置说明。
 
-### 1. 环境要求
-
-- Windows 10/11（其他平台请自行调整 NapCat 启动方式）
-- Python 3.10 或更高版本（开发环境为 Python 3.13）
-- [NapCat.Shell](https://napcat.napneko.icu/guide/boot-shell)（免安装版 QQ 协议端，需本机已安装 QQNT）
-
-### 2. 安装依赖
-
-```powershell
-cd JMBot_v5
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-```
-
-> 若 PowerShell 提示“禁止运行脚本”，请先执行一次：
-> `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`
-
-### 3. 修改配置
-
-```powershell
-Copy-Item config.example.yaml config.yaml
-```
-
-编辑 `config.yaml`，将 `bot_uin`（机器人 QQ 号）与 `root`（超管 QQ 号）替换为你自己的号码。
-
-随后在 NapCat 中配置 WebSocket 服务端：打开 NapCat WebUI（默认 `localhost:6099`）→ 网络配置 → 新建 **WebSocket 服务器**，监听端口填 `3001`，Token 留空（需与 `config.yaml` 中的 `ws_token: ""` 保持一致）。
-
-### 4. 启动
-
-**方式 A：一键启动脚本（推荐）**
-
-编辑 `start_all.bat` 顶部的变量（`NAPCAT_DIR`、`BOT_QQ`、`NCATBOT`），双击运行。脚本将依次完成：启动 NapCat → 等待 3001 端口就绪 → 启动机器人。
-
-**方式 B：手动启动**
-
-```powershell
-# 终端 1：启动 NapCat（附加 QQ 号参数可使用快速登录）
-cd C:\NapCat.Shell
-.\launcher-user.bat 你的QQ号
-
-# 终端 2：启动机器人
-cd JMBot_v5
-.\.venv\Scripts\ncatbot.exe run
-```
-
-首次启动需使用手机 QQ 扫描二维码登录，此后带 QQ 号参数启动即可快速登录。
-
-### 5. 命令一览
-
-| 命令                                | 功能                                                                   | 权限                       |
-| ----------------------------------- | ---------------------------------------------------------------------- | -------------------------- |
-| `/jm <id> [id ...]`                 | 下载并回传 PDF，支持多个 ID                                            | 群聊需先开启，私聊默认可用 |
-| `/jm -h <id>`                       | 超分辨率下载（用配置页选定的默认模型，耗时较长，请耐心等待）           | 群聊需先开启，私聊默认可用 |
-| `/jm -hr <id>`                      | 超分辨率下载（Real-ESRGAN anime 模型 4x，首次自动下载约 45MB 工具包）  | 群聊需先开启，私聊默认可用 |
-| `/jm -hw <id>`                      | 超分辨率下载（waifu2x cunet 动漫模型 2x，首次自动下载约 35MB 工具包）  | 群聊需先开启，私聊默认可用 |
-| `/jm help`                          | 查看使用帮助                                                           | 所有人                     |
-| `/jms <关键词>`                     | 站内搜索本子（每页 10 条，回复 `1` 翻页 / `0` 退出），兼容无空格写法   | 群聊需先开启，私聊默认可用 |
-| `/jma <作者名>`                     | 按作者搜索本子（每页 10 条，回复 `1` 翻页 / `0` 退出），兼容无空格写法 | 群聊需先开启，私聊默认可用 |
-| `/jmv <任意含车号的文本>`           | 查询本子详情（不下载），自动提取文本中的车号，支持直接粘贴链接         | 群聊需先开启，私聊默认可用 |
-| `开启JMBot` / `关闭JMBot`           | 开启 / 关闭群聊下载                                                    | 超管                       |
-| `测试JMBot`                         | 检查插件运行状态                                                       | 超管                       |
-| `打开加密` / `关闭加密`             | 开关群聊 PDF 加密                                                      | 超管                       |
-| `PDF密码` / `设置PDF密码 xxx`       | 查看 / 设置 PDF 打开密码                                               | 超管                       |
-| `设置JM账号 xxx` / `设置JM密码 xxx` | 保存 JM 凭据并自动登录                                                 | 超管                       |
-| `JM登录` / `JM状态` / `清除JM账号`  | 手动登录 / 查看状态 / 清除凭据                                         | 超管                       |
-| `JM帮助`                            | 查看帮助信息                                                           | 超管                       |
-
-> 建议每条设置命令单独发送一条消息，避免参数被换行内容污染。
->
-> 方法一（AstrBot 插件）的下载与管理命令与上表一致，区别仅为超管 / 加密 / 下载路径等配置优先在 WebUI 中完成；`/jms`、`/jma`、`/jmv` 及超分辨率下载（`-h`/`-hr`/`-hw`）目前为方法一（AstrBot 插件）独有。
+> 注：NcatBot 独立版仅保留 `/jm` 下载核心与管理命令；站内搜索（`/jms`、`/jma`）、详情查询（`/jmv`）、超分辨率下载（`-h/-hr/-hw`）、WebUI 进度页等为 AstrBot 插件版独有。
 
 ---
 
@@ -239,30 +163,25 @@ cd JMBot_v5
 
 ```
 JMBot-Pro
-├── astrbot_plugin_jmbot/      # 方法一（推荐）：NapCat + AstrBot 插件
-│   ├── main.py                #   插件本体
-│   ├── _conf_schema.json      #   WebUI 配置项定义
-│   ├── metadata.yaml          #   插件元数据
-│   └── ...
-└── JMBot_v5/                  # 方法二：NcatBot 插件
-    ├── config.example.yaml    #   主配置模板（复制为 config.yaml 后使用）
-    ├── start_all.bat          #   一键启动脚本（NapCat + 机器人）
-    ├── test_jm_login.py       #   JM 登录链路自测脚本
-    ├── requirements.txt       #   Python 依赖
-    └── plugins/JMBot/         #   插件本体
+└── astrbot_plugin_jmbot/      # NapCat + AstrBot 插件
+    ├── main.py                #   插件本体
+    ├── _conf_schema.json      #   WebUI 配置项定义
+    ├── metadata.yaml          #   插件元数据
+    ├── pages/progress/        #   WebUI 实时下载进度页
+    └── ...
 ```
 
-敏感配置（`config.yaml`、`jm_account.json`、`pdf_password.txt` 等）与下载产物均不会进入版本库，详见 [`.gitignore`](.gitignore)。
+敏感配置（`jm_account.json`、`pdf_password.txt` 等）与下载产物均不会进入版本库，详见 [`.gitignore`](.gitignore)。
 
 ---
 
 ## 常见问题
 
-- **选哪种方式？** 没有特殊需求就选方法一（NapCat + AstrBot 插件）：图形化配置、装完即用；只有想单独跑一个轻量机器人、或不想引入 AstrBot 时才用方法二。
-- **提示域名解析失败**：JM 域名可能因网络环境无法解析。jmcomic 会自动获取可用域名；必要时可在 jmcomic 配置（`plugins/JMBot/config/config.yml`）的 `client.domain` 中手动指定可用域名，或为终端配置代理。
+- **想要不依赖 AstrBot 的独立机器人？** 请使用姊妹仓库 [JMBot-NcatBot](https://github.com/Sanshui755/JMBot-NcatBot)（NapCat + NcatBot）。
+- **提示域名解析失败**：JM 域名可能因网络环境无法解析。jmcomic 会自动获取可用域名；必要时可在 jmcomic 配置的 `client.domain` 中手动指定可用域名，或为终端配置代理。
 - **登录返回 401**：请核对账号与密码，并确保每条设置命令单独发送。
 - **群聊中无响应**：群聊下载默认关闭，请先由超管私聊机器人发送 `开启JMBot`。
-- **修改代码后不生效**：AstrBot 版在 WebUI 中重载插件；NcatBot 版可私聊机器人发送 `!reload JMBot` 热重载。
+- **修改代码后不生效**：在 AstrBot WebUI 中重载插件即可。
 
 ---
 
