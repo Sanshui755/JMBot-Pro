@@ -31,7 +31,7 @@ from pathlib import Path
 import jmcomic
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.api.message_components import File
+from astrbot.api.message_components import File, Image, Plain
 from astrbot.api.star import Context, Star, register
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 from jmcomic.jm_exception import MissingAlbumPhotoException
@@ -204,12 +204,15 @@ ALBUM_NOT_FOUND_TEXT = (
 )
 
 # ---------------- 下载产物自动清理 ----------------
-# 下载路径下的三个产物子文件夹
-CLEANUP_DIRS = ("stock", "pdf", "encrypt_pdf")
+# 下载路径下的产物/缓存子文件夹（cover_cache 为 /jmv 封面缓存，按车号命名）
+COVER_CACHE_DIRNAME = "cover_cache"
+CLEANUP_DIRS = ("stock", "pdf", "encrypt_pdf", COVER_CACHE_DIRNAME)
 # 文件保留时长：3 天
 CLEANUP_KEEP_SECONDS = 3 * 24 * 60 * 60
 # 自动清理执行间隔：6 小时
 CLEANUP_INTERVAL_SECONDS = 6 * 60 * 60
+# /jmv 封面下载超时（秒）：封面为普通 jpg，超时即降级为纯文本详情
+COVER_FETCH_TIMEOUT = 15
 # 默认下载路径（其下自动创建 stock/pdf/encrypt_pdf；可在配置或聊天命令中修改）
 # 默认保存到用户目录下的 JMBot-Downloads，例如 Windows: C:\Users\你\JMBot-Downloads
 DEFAULT_DOWNLOAD_ROOT = str(Path.home() / "JMBot-Downloads")
@@ -591,7 +594,7 @@ def _webui_tasks_snapshot() -> dict:
         }
 
 
-@register("astrbot_plugin_jmbot", "Sanshui755", "禁漫下载插件，批量下载/搜索翻页/双模型超分辨率/路径可配/自动清理", "2.3.4", "")
+@register("astrbot_plugin_jmbot", "Sanshui755", "禁漫下载插件，批量下载/搜索翻页/双模型超分辨率/路径可配/自动清理", "2.4.0", "")
 class JMBot(Star):
     """JMBot 插件"""
 
@@ -687,7 +690,7 @@ class JMBot(Star):
         self._background_tasks.add(cleanup_task)
         cleanup_task.add_done_callback(self._background_tasks.discard)
 
-        logger.info("JMBot v2.3.4 已加载（指令消息已隔离：屏蔽默认 LLM 与陪伴/记忆插件）")
+        logger.info("JMBot v2.4.0 已加载（指令消息已隔离：屏蔽默认 LLM 与陪伴/记忆插件）")
         logger.info(f"JMBot 插件超管: {self.super_user or '(未配置)'}")
         logger.info(f"JMBot 下载目录: {self.download_root}")
 
@@ -784,6 +787,8 @@ class JMBot(Star):
                 _plist.append({"plugin": _key})
         # 三个产物文件夹统一在下载路径下自动创建
         (self.download_root / "encrypt_pdf").mkdir(parents=True, exist_ok=True)
+        # /jmv 封面缓存目录
+        (self.download_root / COVER_CACHE_DIRNAME).mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
     # JM 账号：本地保存 / 读取 / 登录
@@ -1022,11 +1027,33 @@ class JMBot(Star):
 
         yield event.plain_result(f"正在查询本子 {album_id} 的详情……")
         try:
-            detail = await self._fetch_album_detail(album_id)
-            yield event.plain_result(self._format_album_detail(detail))
+            # 先确保登录，避免详情与封面两条并发请求触发重复登录流程
+            await self._ensure_jm_login()
+            # 封面 URL 只依赖车号，与详情查询并发，总延迟取两者最大值
+            detail, cover_path = await asyncio.gather(
+                self._fetch_album_detail(album_id),
+                self._fetch_album_cover(album_id),
+            )
         except Exception as e:
             logger.exception(f"/jmv 查询本子 {album_id} 详情失败: {e}")
             yield event.plain_result(self._format_view_error(album_id, e))
+            return
+
+        header, body = self._format_album_detail(detail)
+        if cover_path is not None:
+            # 一条消息链：车号+标题 → 封面图 → 其余详情（QQ 按段顺序渲染）
+            try:
+                yield event.chain_result(
+                    [
+                        Plain(header),
+                        Image.fromFileSystem(str(cover_path)),
+                        Plain(body),
+                    ]
+                )
+                return
+            except Exception as e:  # noqa: BLE001 - 图文消息发送失败时回退纯文本
+                logger.warning(f"/jmv 图文消息发送失败，回退纯文本: {album_id}: {e}")
+        yield event.plain_result("\n".join((header, body)))
 
     # ------------------------------------------------------------------
     # /jms 站内搜索 & /jma 作者搜索（不下载，群聊/私聊均可触发）
@@ -1652,6 +1679,42 @@ class JMBot(Star):
             return ALBUM_NOT_FOUND_TEXT.format(album=album_id)
         return f"查询本子详情失败：{e}"
 
+    async def _fetch_album_cover(self, album_id: str) -> Path | None:
+        """下载本子原版封面大图到 cover_cache，返回本地文件路径。
+
+        - 按车号命名缓存（``cover_cache/<车号>.jpg``），重复查询直接复用；
+        - 封面是普通 jpg，不需要章节图的打乱还原（jmcomic 内部 decode_image=False）；
+        - 任何失败（超时/网络异常/空文件）都返回 None，由调用方降级为
+          纯文本详情，绝不拖垮 /jmv 主流程。
+        """
+        cover_dir = self.download_root / COVER_CACHE_DIRNAME
+        cover_path = cover_dir / f"{album_id}.jpg"
+        try:
+            if cover_path.exists() and cover_path.stat().st_size > 0:
+                return cover_path
+            cover_dir.mkdir(parents=True, exist_ok=True)
+
+            def _download_cover() -> None:
+                client = self.jm_option.build_jm_client()
+                client.download_album_cover(album_id, str(cover_path))
+
+            await asyncio.wait_for(
+                asyncio.to_thread(_download_cover),
+                timeout=COVER_FETCH_TIMEOUT,
+            )
+            if cover_path.exists() and cover_path.stat().st_size > 0:
+                return cover_path
+            logger.warning(f"/jmv 封面下载结果为空文件: {album_id}")
+            cover_path.unlink(missing_ok=True)
+        except Exception as e:  # noqa: BLE001 - 封面失败只需降级，不需中断查询
+            logger.warning(f"/jmv 封面下载失败，降级为纯文本: {album_id}: {e}")
+            try:
+                if cover_path.exists() and cover_path.stat().st_size == 0:
+                    cover_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return None
+
     async def _fetch_album_detail(self, album_id: str):
         """请求本子详情实体（只发一次详情请求，不下载任何图片）。
 
@@ -1748,8 +1811,11 @@ class JMBot(Star):
         return "\n".join(lines)
 
     @staticmethod
-    def _format_album_detail(detail) -> str:
-        """把 JmAlbumDetail 渲染成发给用户的纯文本详情。
+    def _format_album_detail(detail) -> tuple[str, str]:
+        """把 JmAlbumDetail 渲染成 (header, body) 两段文本。
+
+        header 只含车号与标题，用于放在封面图上方；body 为其余全部信息，
+        放在封面图下方。无封面降级时调用方直接用换行拼接两段即为旧版纯文本。
 
         移动端 API 不返回页数/发布日期/更新日期（对应字段为 0 或
         ``'0'``），也不返回完整标签和作者。这些字段仅在有有效值时展示。
@@ -1763,10 +1829,14 @@ class JMBot(Star):
         tags = list(detail.tags or [])
         tag_text = join_list(tags)
 
-        lines = [
-            f"本子详情（车号 {detail.album_id}）",
-            f"标题：{detail.name or '无'}",
-        ]
+        # header：封面图上方只放车号+标题
+        header = (
+            f"本子详情（车号 {detail.album_id}）\n"
+            f"标题：{detail.name or '无'}"
+        )
+
+        # body：封面图下方的其余信息
+        body: list[str] = []
 
         # 作者：优先取 API/HTML 返回；为空则从标题 [xxx] 方括号提取
         authors = join_list(detail.authors)
@@ -1775,34 +1845,34 @@ class JMBot(Star):
             if brackets:
                 authors = "、".join(brackets)
         if authors != "无":
-            lines.append(f"作者：{authors}")
+            body.append(f"作者：{authors}")
 
         actors = join_list(detail.actors)
         if actors != "无":
-            lines.append(f"登场人物：{actors}")
+            body.append(f"登场人物：{actors}")
 
         works = join_list(detail.works)
         if works != "无":
-            lines.append(f"作品：{works}")
+            body.append(f"作品：{works}")
 
-        lines.append(f"标签：{tag_text}")
+        body.append(f"标签：{tag_text}")
 
         # 页数/章节：移动端 API 恒为 0，仅网页端能取到时才展示
         page_count = int(getattr(detail, "page_count", 0) or 0)
         if page_count > 0:
             episode_count = len(detail.episode_list)
             suffix = f"（共 {episode_count} 章）" if episode_count > 1 else ""
-            lines.append(f"页数：{page_count} 页{suffix}")
+            body.append(f"页数：{page_count} 页{suffix}")
 
         # 发布/更新日期：移动端 API 恒为 '0'，仅有效值才展示
         pub_date = str(getattr(detail, "pub_date", "") or "").strip()
         update_date = str(getattr(detail, "update_date", "") or "").strip()
         if pub_date and pub_date != "0":
-            lines.append(f"发布：{pub_date}")
+            body.append(f"发布：{pub_date}")
         if update_date and update_date != "0":
-            lines.append(f"更新：{update_date}")
+            body.append(f"更新：{update_date}")
 
-        lines.append(
+        body.append(
             f"喜欢：{detail.likes or 0} ｜ 观看：{detail.views or 0}"
             f" ｜ 评论：{detail.comment_count}"
         )
@@ -1812,11 +1882,11 @@ class JMBot(Star):
             # 简介可能很长，截断防止消息过长
             if len(description) > 120:
                 description = description[:120] + "…"
-            lines.append(f"简介：{description}")
+            body.append(f"简介：{description}")
 
-        lines.append(f"链接：https://18comic.vip/album/{detail.album_id}/")
-        lines.append(f"需要下载请发送：/jm {detail.album_id}")
-        return "\n".join(lines)
+        body.append(f"链接：https://18comic.vip/album/{detail.album_id}/")
+        body.append(f"需要下载请发送：/jm {detail.album_id}")
+        return header, "\n".join(body)
 
     async def _api_task_progress(self):
         """WebUI 进度页数据源（只读）。"""
