@@ -9,7 +9,7 @@ JMBot —— AstrBot 版禁漫下载插件
 下载产物（stock/pdf/encrypt_pdf）统一保存在「下载路径」下的三个子文件夹中，
 默认为用户目录下的 JMBot-Downloads（Windows: C:\\Users\\你\\JMBot-Downloads），
 可用超管私聊命令「设置下载路径 xxx」修改；
-仅在本机保留 3 天，到期自动删除。
+仅在本机短期保留，到期由自动清理任务删除（保留天数可在插件配置页设置，默认 3 天）。
 管理命令（仅配置的超管，私聊发送）：开启JMBot / 关闭JMBot / 测试JMBot /
 打开加密 / 关闭加密 / PDF密码 / 设置PDF密码 xxx /
 下载路径 / 设置下载路径 xxx /
@@ -124,8 +124,13 @@ from .set_password import set_password_pdf
 PLUGIN_DIR = Path(__file__).resolve().parent
 JM_CONFIG_TEMPLATE = PLUGIN_DIR / "config.yml"
 
-def _build_help_text(default_model_label: str, superres_on: bool) -> str:
-    """根据当前超分配置动态生成 /jm help 文案。"""
+def _build_help_text(
+    default_model_label: str,
+    superres_on: bool,
+    cleanup_on: bool = True,
+    keep_days: int = 3,
+) -> str:
+    """根据当前超分/清理配置动态生成 /jm help 文案。"""
     if superres_on:
         sr = (
             "超分辨率下载（画质提升）：\n"
@@ -149,8 +154,12 @@ def _build_help_text(default_model_label: str, superres_on: bool) -> str:
         "站内搜索：/jms <关键词>（如 /jms 全彩 人妻），结果回复 1 翻页/0 退出\n"
         "按作者搜索：/jma <作者名>（如 /jma AREA188），结果回复 1 翻页/0 退出\n"
         "只看详情不下载：/jmv 350234（可直接粘贴含车号的链接或整段文本）\n"
-        "下载的文件仅在本机保留3天，到期自动删除\n"
-        "如有pdf有密码,默认密码为114514"
+        + (
+            f"下载的文件仅在本机保留{keep_days}天，到期自动删除\n"
+            if cleanup_on
+            else "自动清理已关闭，下载的文件会一直保留（可在插件配置页开启）\n"
+        )
+        + "如有pdf有密码,默认密码为114514"
     )
 
 
@@ -158,6 +167,8 @@ def _get_help_text(plugin: "JMBotPlugin") -> str:
     return _build_help_text(
         SUPERRES_TOOLS[plugin.default_superres_model]["label"],
         plugin.superres_enabled,
+        plugin.cleanup_enabled,
+        plugin.cleanup_keep_days,
     )
 
 JMV_HELP_TEXT = (
@@ -207,8 +218,10 @@ ALBUM_NOT_FOUND_TEXT = (
 # 下载路径下的产物/缓存子文件夹（cover_cache 为 /jmv 封面缓存，按车号命名）
 COVER_CACHE_DIRNAME = "cover_cache"
 CLEANUP_DIRS = ("stock", "pdf", "encrypt_pdf", COVER_CACHE_DIRNAME)
-# 文件保留时长：3 天
-CLEANUP_KEEP_SECONDS = 3 * 24 * 60 * 60
+# 文件保留天数的默认值与允许范围（配置页「文件保留天数」可改）
+CLEANUP_KEEP_DAYS_DEFAULT = 3
+CLEANUP_KEEP_DAYS_MIN = 1
+CLEANUP_KEEP_DAYS_MAX = 365
 # 自动清理执行间隔：6 小时
 CLEANUP_INTERVAL_SECONDS = 6 * 60 * 60
 # /jmv 封面下载超时（秒）：封面为普通 jpg，超时即降级为纯文本详情
@@ -594,7 +607,7 @@ def _webui_tasks_snapshot() -> dict:
         }
 
 
-@register("astrbot_plugin_jmbot", "Sanshui755", "禁漫下载插件，批量下载/搜索翻页/双模型超分辨率/路径可配/自动清理", "2.4.0", "")
+@register("astrbot_plugin_jmbot", "Sanshui755", "禁漫下载插件，批量下载/搜索翻页/双模型超分辨率/每日签到/自动清理可配", "2.5.0", "")
 class JMBot(Star):
     """JMBot 插件"""
 
@@ -612,6 +625,13 @@ class JMBot(Star):
         # 运行时文件路径（账号、jmcomic 配置仍留在插件数据目录）
         self.jm_config_path = self.data_dir / "config.yml"
         self.jm_account_path = self.data_dir / "jm_account.json"
+        # 每日签到状态文件：记录最近一次签到结果与成功日期，重启后不重复签到
+        self.checkin_state_path = self.data_dir / "jm_checkin.json"
+        self._checkin_state: dict = {}
+        self._last_checkin_date: str = self._load_checkin_state()
+        self._checkin_lock = asyncio.Lock()
+        # 把上次签到结果回填到配置页「签到信息」文本框（仅内存，不落配置文件）
+        self.config["checkin_info"] = self._format_checkin_info()
 
         # 下载路径（其下自动创建 stock/pdf/encrypt_pdf）
         self.download_root.mkdir(parents=True, exist_ok=True)
@@ -619,6 +639,7 @@ class JMBot(Star):
         # JM 账号状态
         self.jm_username: str = ""
         self.jm_password: str = ""
+        self.jm_user_id: str = ""  # 移动端 API 签到所需的用户 uid（登录响应中获取）
         self.jm_logged_in: bool = False
         self.jm_cred_source: str = "无"  # 无 / 本地保存 / WebUI 配置
         self._background_tasks: set = set()
@@ -685,12 +706,16 @@ class JMBot(Star):
                 "设置JM账号 / 设置JM密码"
             )
 
-        # 启动下载产物自动清理任务（先清理一次，之后每隔 6 小时清理）
-        cleanup_task = asyncio.create_task(self._cleanup_loop())
-        self._background_tasks.add(cleanup_task)
-        cleanup_task.add_done_callback(self._background_tasks.discard)
+        # 启动下载产物自动清理任务（先清理一次，之后每隔 6 小时清理）；
+        # 配置页「下载产物自动清理」关闭时不启动，文件由用户自行管理
+        if self.cleanup_enabled:
+            cleanup_task = asyncio.create_task(self._cleanup_loop())
+            self._background_tasks.add(cleanup_task)
+            cleanup_task.add_done_callback(self._background_tasks.discard)
+        else:
+            logger.warning("JMBot 下载产物自动清理已关闭（配置页可重新开启），文件将长期保留")
 
-        logger.info("JMBot v2.4.0 已加载（指令消息已隔离：屏蔽默认 LLM 与陪伴/记忆插件）")
+        logger.info("JMBot v2.5.0 已加载（指令消息已隔离：屏蔽默认 LLM 与陪伴/记忆插件）")
         logger.info(f"JMBot 插件超管: {self.super_user or '(未配置)'}")
         logger.info(f"JMBot 下载目录: {self.download_root}")
 
@@ -739,6 +764,25 @@ class JMBot(Star):
     def superres_enabled(self) -> bool:
         """超分辨率功能总开关（配置页可关闭，性能差的服务器可禁用）。"""
         return bool(self.config.get("superres_enabled", True))
+
+    @property
+    def checkin_enabled(self) -> bool:
+        """每日自动签到开关（配置页可关闭，默认开启）。"""
+        return bool(self.config.get("checkin_enabled", True))
+
+    @property
+    def cleanup_enabled(self) -> bool:
+        """下载产物自动清理开关（配置页可关闭，默认开启）。"""
+        return bool(self.config.get("cleanup_enabled", True))
+
+    @property
+    def cleanup_keep_days(self) -> int:
+        """下载产物保留天数；非法/越界值回退默认 3 天，允许范围 1-365。"""
+        try:
+            days = int(self.config.get("cleanup_keep_days", CLEANUP_KEEP_DAYS_DEFAULT))
+        except (TypeError, ValueError):
+            return CLEANUP_KEEP_DAYS_DEFAULT
+        return max(CLEANUP_KEEP_DAYS_MIN, min(CLEANUP_KEEP_DAYS_MAX, days))
 
     @property
     def default_superres_model(self) -> str:
@@ -832,9 +876,12 @@ class JMBot(Star):
         if not self.jm_username or not self.jm_password:
             raise ValueError("尚未保存 JM 账号或密码")
         client = self.jm_option.build_jm_client()
-        client.login(self.jm_username, self.jm_password)
+        login_resp = client.login(self.jm_username, self.jm_password)
         # 登录后的 cookies 写入 option，后续下载 client 自动携带
         self.jm_option.update_cookies(dict(client["cookies"]))
+        # 记录 uid 供每日签到（移动端 /daily_chk）使用
+        res_data = getattr(login_resp, "res_data", None)
+        self.jm_user_id = str((res_data or {}).get("uid", "") or "")
 
     async def _jm_login(self) -> tuple[bool, str]:
         """执行 JM 登录，返回 (是否成功, 提示消息)。"""
@@ -853,6 +900,190 @@ class JMBot(Star):
         if self.jm_username and self.jm_password and not self.jm_logged_in:
             ok, msg = await self._jm_login()
             logger.info(f"下载前自动登录: {msg}")
+        # 登录态确认后，顺带调度「每日首次调用自动签到」（后台执行，不阻塞指令）
+        self._schedule_daily_checkin()
+
+    # ------------------------------------------------------------------
+    # 每日自动签到（移动端 /daily + /daily_chk，静默执行仅记日志）
+    # ------------------------------------------------------------------
+
+    def _load_checkin_state(self) -> str:
+        """读取签到状态文件并缓存到 ``self._checkin_state``。
+
+        返回上次签到成功日期（YYYY-MM-DD）；无记录或文件损坏返回空串。
+        """
+        try:
+            data = json.loads(self.checkin_state_path.read_text(encoding="utf-8"))
+            self._checkin_state = data if isinstance(data, dict) else {}
+            return str(self._checkin_state.get("date", "")).strip()
+        except FileNotFoundError:
+            self._checkin_state = {}
+            return ""
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning(f"JM 签到状态文件读取失败: {e}")
+            self._checkin_state = {}
+            return ""
+
+    def _save_checkin_state(
+        self, *, result: str, msg: str, date_str: str | None
+    ) -> None:
+        """落盘签到结果（时间/结论/详情）；``date_str`` 为 None 时保留原日期。
+
+        成功或确认「今日已签」才会更新 date；失败保留旧日期，使当天后续
+        JM 调用继续重试。
+        """
+        state = dict(self._checkin_state)
+        state.update(
+            {
+                "last_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "result": result,
+                "msg": msg,
+            }
+        )
+        if date_str is not None:
+            state["date"] = date_str
+        self._checkin_state = state
+        try:
+            self.checkin_state_path.write_text(
+                json.dumps(state, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except OSError as e:
+            logger.warning(f"JM 签到状态保存失败: {e}")
+
+    def _format_checkin_info(self) -> str:
+        """生成配置页「签到信息」文本框展示的一行状态。"""
+        state = self._checkin_state or {}
+        last_time = str(state.get("last_time", "")).strip()
+        result = str(state.get("result", "")).strip()
+        msg = str(state.get("msg", "")).strip()
+        if not last_time or not result:
+            # 兼容旧版本只记录 date 的状态文件
+            date_str = str(state.get("date", "")).strip()
+            if date_str == time.strftime("%Y-%m-%d"):
+                return f"[今日已签到] {date_str}（旧版本记录，暂无时间与奖励详情）"
+            if date_str:
+                return (
+                    f"今日尚未执行签到（上次成功签到：{date_str}；"
+                    "今天首次使用 JM 指令后结果将显示在此处）"
+                )
+            return (
+                "今日尚未执行签到（今天第一次使用 /jm、/jmv、/jms、/jma "
+                "任一指令后自动签到，结果显示在此处）"
+            )
+        today = time.strftime("%Y-%m-%d")
+        is_today = last_time.startswith(today)
+        badge = {
+            "success": "[签到成功]",
+            "already": "[今日已签到]",
+            "fail": "[签到失败]",
+        }.get(result, f"[{result}]")
+        head = f"{badge} {last_time}"
+        tail = f"：{msg}" if msg else ""
+        if result == "fail" and is_today:
+            return f"{head}{tail}（当天后续使用 JM 指令会自动重试）"
+        if not is_today and result in ("success", "already"):
+            return f"{head}{tail}（今日尚未执行，首次使用 JM 指令时自动签到）"
+        return f"{head}{tail}"
+
+    def _record_checkin_result(
+        self, result: str, msg: str, date_str: str | None
+    ) -> None:
+        """记录一次签到结果：落盘 + 同步刷新配置页文本框（内存值）。"""
+        self._save_checkin_state(result=result, msg=msg, date_str=date_str)
+        try:
+            self.config["checkin_info"] = self._format_checkin_info()
+        except Exception:  # noqa: BLE001 - 展示信息失败不影响签到主流程
+            pass
+
+    def _daily_checkin_sync(self) -> tuple[str, str]:
+        """执行一次每日签到（在线程中调用），返回 ``(结果分类, 服务端文案)``。
+
+        走移动端 API（与下载同一套可达域名，比网页端稳定；网页端域名
+        在部分网络下无法连接）：
+        1. ``GET /daily?user_id=<uid>`` 获取当日打卡任务 ``daily_id``；
+        2. ``POST /daily_chk``（user_id + daily_id）完成打卡。
+
+        - 成功：``("success", "Jcoin:30 EXP:30")``；
+        - 今日已签：``("already", "今天已经签到过了")``（实测文案）；
+        - 其余情况抛异常交由上层重试/记日志。
+        """
+        client = self.jm_option.build_jm_client()
+        uid = self.jm_user_id
+        if not uid:
+            # 重启后尚未走过登录流程时兜底：重新登录以换取 uid 与 cookies
+            login_resp = client.login(self.jm_username, self.jm_password)
+            self.jm_option.update_cookies(dict(client["cookies"]))
+            uid = str((getattr(login_resp, "res_data", None) or {}).get("uid", "") or "")
+        if not uid:
+            raise RuntimeError("登录响应中未获取到用户 uid")
+
+        daily_resp = client.req_api("/daily", params={"user_id": uid})
+        daily_id = str((daily_resp.res_data or {}).get("daily_id", "") or "")
+        if not daily_id:
+            raise RuntimeError("签到信息中缺少 daily_id")
+
+        chk_resp = client.req_api(
+            "/daily_chk",
+            get=False,
+            data={"user_id": uid, "daily_id": daily_id},
+        )
+        res_data = chk_resp.res_data or {}
+        msg = str(res_data.get("msg", "")).strip() or "(服务端无提示)"
+        # 服务端实测文案：成功「Jcoin:30 EXP:30」；重复「今天已经签到过了」
+        if any(
+            kw in msg
+            for kw in (
+                "已經簽到", "已经签到", "已签到", "已簽到",
+                "簽到過", "签到过", "已完成",
+            )
+        ):
+            return "already", msg
+        if "Jcoin" in msg or "EXP" in msg or res_data.get("status") == "ok" or "成功" in msg:
+            return "success", msg
+        raise RuntimeError(msg)
+
+    async def _try_daily_checkin(self) -> None:
+        """每天首次调用时尝试签到；失败不记录日期，当天后续调用自动重试。"""
+        today = time.strftime("%Y-%m-%d")
+        if self._last_checkin_date == today:
+            return
+        async with self._checkin_lock:
+            # 双检：等锁期间可能已被其他并发指令签过
+            if self._last_checkin_date == today:
+                return
+            try:
+                await self._ensure_jm_login()
+                if not self.jm_logged_in:
+                    logger.warning("JM 每日签到跳过：账号未登录")
+                    self._record_checkin_result(
+                        "fail", "账号未登录，已跳过（请检查 JM 账号/密码配置）", None
+                    )
+                    return
+                kind, msg = await asyncio.to_thread(self._daily_checkin_sync)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 - 签到失败不影响任何主流程
+                logger.warning(f"JM 每日签到失败（当天后续 JM 调用会自动重试）: {e}")
+                self._record_checkin_result("fail", str(e), None)
+                return
+            # 只有成功或确认「今日已签」才记录日期
+            self._last_checkin_date = today
+            self._record_checkin_result(kind, msg, today)
+            label = "签到成功" if kind == "success" else "今日已签到"
+            logger.info(f"JM 每日签到：{label}：{msg}")
+
+    def _schedule_daily_checkin(self) -> None:
+        """调度后台签到任务（已签/已关闭/已在跑时直接跳过）。"""
+        if not self.checkin_enabled:
+            return
+        if self._last_checkin_date == time.strftime("%Y-%m-%d"):
+            return
+        if self._checkin_lock.locked():
+            return
+        task = asyncio.create_task(self._try_daily_checkin())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     # ------------------------------------------------------------------
     # /jm 下载指令（正式注册，群聊/私聊均可触发）
@@ -2280,7 +2511,7 @@ class JMBot(Star):
         return str(dst_path.resolve())
 
     # ------------------------------------------------------------------
-    # 旧下载目录迁移 & 下载产物自动清理（保留 3 天）
+    # 旧下载目录迁移 & 下载产物自动清理（保留天数由配置页 cleanup_keep_days 决定）
     # ------------------------------------------------------------------
 
     def _legacy_download_roots(self, extra: list[Path] | None = None) -> list[Path]:
@@ -2390,11 +2621,12 @@ class JMBot(Star):
 
         while True:
             try:
-                removed = await asyncio.to_thread(self._cleanup_old_files)
+                keep_days = self.cleanup_keep_days
+                removed = await asyncio.to_thread(self._cleanup_old_files, keep_days)
                 if removed:
                     logger.info(
                         f"JMBot 自动清理：已删除 {removed} 个超过 "
-                        f"{CLEANUP_KEEP_SECONDS // (24 * 60 * 60)} 天的下载文件"
+                        f"{keep_days} 天的下载文件"
                     )
             except asyncio.CancelledError:
                 raise
@@ -2402,13 +2634,13 @@ class JMBot(Star):
                 logger.warning(f"JMBot 自动清理失败: {e}")
             await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
 
-    def _cleanup_old_files(self) -> int:
-        """删除 download_root 下 stock/pdf/encrypt_pdf 中超过 3 天的文件及空目录。
+    def _cleanup_old_files(self, keep_days: int = CLEANUP_KEEP_DAYS_DEFAULT) -> int:
+        """删除 download_root 下各产物目录中超过 ``keep_days`` 天的文件及空目录。
 
         依据文件 mtime 判断；正在下载/发送的文件都是刚生成的（mtime 很新），
         不会被误删。返回被删除的文件数量。
         """
-        cutoff = time.time() - CLEANUP_KEEP_SECONDS
+        cutoff = time.time() - keep_days * 24 * 60 * 60
         removed = 0
 
         for dirname in CLEANUP_DIRS:

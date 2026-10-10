@@ -52,10 +52,34 @@
         "secret": true,
         "hint": "与上方 JM 账号配套填写，仅在本处与账号一起填写才会生效；也可由超管私聊发送「设置JM密码 密码」保存到本地。"
     },
+    "checkin_enabled": {
+        "description": "每日自动签到",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，每天第一次使用任意 JM 指令（/jm、/jmv、/jms、/jma）时自动在后台完成禁漫账号签到（领取经验/金币），不发送 QQ 消息；当天已签到或网络失败均不影响正常使用，失败会在当天后续调用时自动重试。"
+    },
+    "checkin_info": {
+        "description": "签到信息（自动填写，无需修改）",
+        "type": "string",
+        "default": "今日尚未执行签到（今天第一次使用 /jm、/jmv、/jms、/jma 任一指令后自动签到，结果显示在此处）",
+        "hint": "本框由插件自动回填，显示最近一次签到的时间与结果（签到成功/今日已签到/签到失败原因），手动修改无效；重新打开本配置页即可看到最新内容，无需翻日志。"
+    },
     "download_root": {
         "description": "下载文件保存路径",
         "type": "string",
         "default": "",
-        "hint": "留空则保存到 用户目录\\JMBot-Downloads；其下会自动创建 stock（原图）/pdf/encrypt_pdf（加密PDF）三个文件夹。也可私聊超管发送「设置下载路径 路径」修改，旧文件会自动迁移。文件保留3天后自动删除。"
+        "hint": "留空则保存到 用户目录\\JMBot-Downloads；其下会自动创建 stock（原图）/pdf/encrypt_pdf（加密PDF）三个文件夹。也可私聊超管发送「设置下载路径 路径」修改，旧文件会自动迁移。"
+    },
+    "cleanup_enabled": {
+        "description": "下载产物自动清理",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，下载目录中的原图/PDF/加密PDF/封面缓存会按下方「保留天数」自动删除，避免长期占用磁盘；关闭后文件将一直保留，需要手动清理。"
+    },
+    "cleanup_keep_days": {
+        "description": "文件保留天数",
+        "type": "int",
+        "default": 3,
+        "hint": "下载产物在磁盘上保留的天数（按文件生成时间计算），超过后由自动清理任务删除，可填 1-365 的整数，默认 3 天。仅在上方「下载产物自动清理」开启时生效。"
     }
 }
