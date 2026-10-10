@@ -619,7 +619,7 @@ def _webui_tasks_snapshot() -> dict:
         }
 
 
-@register("astrbot_plugin_jmbot", "Sanshui755", "禁漫下载插件，批量下载/搜索翻页/双模型超分辨率/每日签到/自动清理可配", "2.5.1", "")
+@register("astrbot_plugin_jmbot", "Sanshui755", "禁漫下载插件，批量下载/搜索翻页/双模型超分辨率/每日签到/自动清理可配", "2.5.2", "")
 class JMBot(Star):
     """JMBot 插件"""
 
@@ -727,7 +727,7 @@ class JMBot(Star):
         else:
             logger.warning("JMBot 下载产物自动清理已关闭（配置页可重新开启），文件将长期保留")
 
-        logger.info("JMBot v2.5.1 已加载（指令消息已隔离：屏蔽默认 LLM 与陪伴/记忆插件）")
+        logger.info("JMBot v2.5.2 已加载（指令消息已隔离：屏蔽默认 LLM 与陪伴/记忆插件）")
         logger.info(f"JMBot 插件超管: {self.super_user or '(未配置)'}")
         logger.info(f"JMBot 下载目录: {self.download_root}")
 
@@ -1309,8 +1309,8 @@ class JMBot(Star):
         )
         for i, album_id in enumerate(album_ids):
             if i > 0:
-                # 简单限速，避免连续请求触发 JM 风控
-                await asyncio.sleep(1)
+                # 群聊批量发图间隔 2s，避免 NTQQ 连续发图文混合链超时
+                await asyncio.sleep(2)
             async for ret in self._jmv_query_one(event, album_id):
                 yield ret
 
@@ -1331,18 +1331,36 @@ class JMBot(Star):
 
         header, body = self._format_album_detail(detail)
         if cover_path is not None:
-            # 一条消息链：车号+标题 → 封面图 → 其余详情（QQ 按段顺序渲染）
-            try:
-                yield event.chain_result(
-                    [
-                        Plain(header),
-                        Image.fromFileSystem(str(cover_path)),
-                        Plain(body),
-                    ]
-                )
-                return
-            except Exception as e:  # noqa: BLE001 - 图文消息发送失败时回退纯文本
-                logger.warning(f"/jmv 图文消息发送失败，回退纯文本: {album_id}: {e}")
+            # 用 event.send 直发而非 yield chain_result：后者把发送交给框架
+            # respond 阶段，NTQQ 发图超时(retcode=1200)的异常发生在框架内部，
+            # 插件 try/except 捕获不到，纯文本回退分支永远不触发。
+            # 直发则异常在插件内抛出，可捕获后重试或回退纯文本。
+            chain = MessageChain(
+                chain=[
+                    Plain(header),
+                    Image.fromFileSystem(str(cover_path)),
+                    Plain(body),
+                ]
+            )
+            # 最多重试 2 次（含首次），间隔 2s，仍失败则回退纯文本
+            for attempt in range(1, 3):
+                try:
+                    await event.send(chain)
+                    if attempt > 1:
+                        logger.info(f"/jmv 图文消息第 {attempt} 次发送成功: {album_id}")
+                    return
+                except Exception as e:  # noqa: BLE001 - NTQQ 发图超时等
+                    if attempt < 2:
+                        logger.warning(
+                            f"/jmv 图文消息发送失败（第 {attempt} 次），"
+                            f"2s 后重试: {album_id}: {e}"
+                        )
+                        await asyncio.sleep(2)
+                    else:
+                        logger.warning(
+                            f"/jmv 图文消息发送失败（第 {attempt} 次），"
+                            f"回退纯文本: {album_id}: {e}"
+                        )
         yield event.plain_result("\n".join((header, body)))
 
     # ------------------------------------------------------------------
