@@ -5,7 +5,7 @@ JMBot —— AstrBot 版禁漫下载插件
 支持批量：``/jm 350234 350235`` 或一条消息内多条 ``/jm`` 指令，
 数字后紧跟中文备注（如 ``/jm 350234极品``）也能正确识别。
 发送 ``/jmv <任意含车号的文本>`` 只查询本子详情（标题/作者/标签/页数等），
-不下载任何图片，支持直接粘贴链接或整段文本，自动从中提取车号。
+不下载任何图片，支持批量、直接粘贴链接或整段文本，自动从中提取车号。
 下载产物（stock/pdf/encrypt_pdf）统一保存在「下载路径」下的三个子文件夹中，
 默认为用户目录下的 JMBot-Downloads（Windows: C:\\Users\\你\\JMBot-Downloads），
 可用超管私聊命令「设置下载路径 xxx」修改；
@@ -129,8 +129,10 @@ def _build_help_text(
     superres_on: bool,
     cleanup_on: bool = True,
     keep_days: int = 3,
+    batch_dl_limit: int = 0,
+    batch_jmv_limit: int = 0,
 ) -> str:
-    """根据当前超分/清理配置动态生成 /jm help 文案。"""
+    """根据当前超分/清理/批量上限配置动态生成 /jm help 文案。"""
     if superres_on:
         sr = (
             "超分辨率下载（画质提升）：\n"
@@ -145,15 +147,22 @@ def _build_help_text(
             "超分辨率下载：已关闭（配置页「超分辨率功能总开关」未开启）\n"
             "  /jm -h/-hr/-hw 指令会提示超分已关闭，并以普通模式下载\n"
         )
+    dl_limit_desc = (
+        f"单次最多 {batch_dl_limit} 个" if batch_dl_limit > 0 else "数量不限"
+    )
+    jmv_limit_desc = (
+        f"单次最多 {batch_jmv_limit} 个" if batch_jmv_limit > 0 else "数量不限"
+    )
     return (
         "使用方法：\n输入 /jm+空格+id ，机器人会自动下载生成 pdf 并发送消息。\n"
         "例： /jm 350234\n"
-        "支持批量： /jm 350234 350235（或一条消息里发多条 /jm 指令）\n"
+        f"支持批量： /jm 350234 350235（或一条消息里发多条 /jm 指令，{dl_limit_desc}）\n"
         "数字后加中文备注也可以，如 /jm 350234极品\n"
         + sr +
         "站内搜索：/jms <关键词>（如 /jms 全彩 人妻），结果回复 1 翻页/0 退出\n"
         "按作者搜索：/jma <作者名>（如 /jma AREA188），结果回复 1 翻页/0 退出\n"
-        "只看详情不下载：/jmv 350234（可直接粘贴含车号的链接或整段文本）\n"
+        "只看详情不下载：/jmv 350234（可直接粘贴含车号的链接或整段文本，"
+        f"{jmv_limit_desc}）\n"
         + (
             f"下载的文件仅在本机保留{keep_days}天，到期自动删除\n"
             if cleanup_on
@@ -169,12 +178,15 @@ def _get_help_text(plugin: "JMBotPlugin") -> str:
         plugin.superres_enabled,
         plugin.cleanup_enabled,
         plugin.cleanup_keep_days,
+        plugin.batch_download_limit,
+        plugin.batch_query_limit,
     )
 
 JMV_HELP_TEXT = (
     "本子详情查询（只看不下载）：\n"
     "输入 /jmv+空格+任意含车号的内容，机器人会自动提取其中的数字。\n"
     "例： /jmv 350234\n"
+    "支持批量：/jmv 350234 350235（也可粘贴含多条链接的文本）\n"
     "也可直接粘贴链接或整段文本，如：/jmv https://18comic.vip/album/350234/\n"
     "需要下载请发送 /jm 350234"
 )
@@ -607,7 +619,7 @@ def _webui_tasks_snapshot() -> dict:
         }
 
 
-@register("astrbot_plugin_jmbot", "Sanshui755", "禁漫下载插件，批量下载/搜索翻页/双模型超分辨率/每日签到/自动清理可配", "2.5.0", "")
+@register("astrbot_plugin_jmbot", "Sanshui755", "禁漫下载插件，批量下载/搜索翻页/双模型超分辨率/每日签到/自动清理可配", "2.5.1", "")
 class JMBot(Star):
     """JMBot 插件"""
 
@@ -715,7 +727,7 @@ class JMBot(Star):
         else:
             logger.warning("JMBot 下载产物自动清理已关闭（配置页可重新开启），文件将长期保留")
 
-        logger.info("JMBot v2.5.0 已加载（指令消息已隔离：屏蔽默认 LLM 与陪伴/记忆插件）")
+        logger.info("JMBot v2.5.1 已加载（指令消息已隔离：屏蔽默认 LLM 与陪伴/记忆插件）")
         logger.info(f"JMBot 插件超管: {self.super_user or '(未配置)'}")
         logger.info(f"JMBot 下载目录: {self.download_root}")
 
@@ -783,6 +795,24 @@ class JMBot(Star):
         except (TypeError, ValueError):
             return CLEANUP_KEEP_DAYS_DEFAULT
         return max(CLEANUP_KEEP_DAYS_MIN, min(CLEANUP_KEEP_DAYS_MAX, days))
+
+    @property
+    def batch_download_limit(self) -> int:
+        """单次 /jm 批量下载的数量上限；<=0 或非法值视为无上限（0）。"""
+        return self._read_batch_limit("batch_download_limit")
+
+    @property
+    def batch_query_limit(self) -> int:
+        """单次 /jmv 批量查询的数量上限；<=0 或非法值视为无上限（0）。"""
+        return self._read_batch_limit("batch_query_limit")
+
+    def _read_batch_limit(self, key: str) -> int:
+        """读取批量数量上限配置：正整数生效，0/负数/非法值一律视为无上限。"""
+        try:
+            value = int(self.config.get(key, 0))
+        except (TypeError, ValueError):
+            return 0
+        return value if value > 0 else 0
 
     @property
     def default_superres_model(self) -> str:
@@ -1165,6 +1195,9 @@ class JMBot(Star):
             yield event.plain_result(_get_help_text(self))
             return
 
+        # 批量数量上限（配置页可调，0 表示无上限）
+        dl_limit = self.batch_download_limit
+        album_ids, dropped_ids = self._apply_batch_limit(album_ids, dl_limit)
         total = len(album_ids)
         id_preview = "、".join(album_ids)
         if super_model:
@@ -1175,7 +1208,10 @@ class JMBot(Star):
             )
         else:
             mode_hint = ""
-        yield event.plain_result(f"开始下载 {total} 个本子{mode_hint}：{id_preview}，请稍候……")
+        yield event.plain_result(
+            f"开始下载 {total} 个本子{mode_hint}：{id_preview}，请稍候……"
+            f"{self._batch_limit_note(album_ids, dropped_ids, dl_limit, '下载')}"
+        )
 
         succeeded: list[str] = []
         failed: list[tuple[str, str]] = []
@@ -1242,7 +1278,7 @@ class JMBot(Star):
             event.stop_event()
 
     async def _jmv_impl(self, event: AstrMessageEvent, text: str):
-        """本子详情查询流程，供标准指令与无空格兜底共用。"""
+        """本子详情查询流程，供标准指令与无空格兜底共用；支持批量。"""
         # 与 /jm 相同的消息隔离策略
         self._claim(event)
 
@@ -1251,12 +1287,35 @@ class JMBot(Star):
             # 群聊开关关闭：静默忽略，与 /jm 保持一致
             return
 
-        album_id = self._extract_album_id(text)
-        if not album_id:
+        album_ids = self._extract_album_ids(text)
+        if not album_ids:
             yield event.plain_result(JMV_HELP_TEXT)
             return
 
-        yield event.plain_result(f"正在查询本子 {album_id} 的详情……")
+        # 批量数量上限（配置页可调，0 表示无上限）
+        q_limit = self.batch_query_limit
+        album_ids, dropped_ids = self._apply_batch_limit(album_ids, q_limit)
+
+        if len(album_ids) == 1 and not dropped_ids:
+            yield event.plain_result(f"正在查询本子 {album_ids[0]} 的详情……")
+            async for ret in self._jmv_query_one(event, album_ids[0]):
+                yield ret
+            return
+
+        # 批量：先报总数与当前上限，再逐个查询发送；单条失败不影响其余
+        yield event.plain_result(
+            f"正在批量查询 {len(album_ids)} 个本子：{'、'.join(album_ids)}……"
+            f"{self._batch_limit_note(album_ids, dropped_ids, q_limit, '查询')}"
+        )
+        for i, album_id in enumerate(album_ids):
+            if i > 0:
+                # 简单限速，避免连续请求触发 JM 风控
+                await asyncio.sleep(1)
+            async for ret in self._jmv_query_one(event, album_id):
+                yield ret
+
+    async def _jmv_query_one(self, event: AstrMessageEvent, album_id: str):
+        """查询单个本子并按「车号+标题 → 封面图 → 其余详情」发送。"""
         try:
             # 先确保登录，避免详情与封面两条并发请求触发重复登录流程
             await self._ensure_jm_login()
@@ -1522,6 +1581,10 @@ class JMBot(Star):
         if not album_ids:
             return
 
+        # 批量数量上限（配置页可调，0 表示无上限）
+        dl_limit = self.batch_download_limit
+        album_ids, dropped_ids = self._apply_batch_limit(album_ids, dl_limit)
+
         is_group = not event.is_private_chat()
         if is_group and not self.jm_on:
             return
@@ -1536,7 +1599,10 @@ class JMBot(Star):
             )
         else:
             mode_hint = ""
-        yield event.plain_result(f"开始下载 {total} 个本子{mode_hint}：{id_preview}，请稍候……")
+        yield event.plain_result(
+            f"开始下载 {total} 个本子{mode_hint}：{id_preview}，请稍候……"
+            f"{self._batch_limit_note(album_ids, dropped_ids, dl_limit, '下载')}"
+        )
 
         succeeded: list[str] = []
         failed: list[tuple[str, str]] = []
@@ -1843,25 +1909,58 @@ class JMBot(Star):
         return list(dict.fromkeys(album_ids))
 
     @staticmethod
-    def _extract_album_id(text: str) -> str:
-        """从任意文本中提取一个本子 id（``/jmv`` 专用）。
+    def _extract_album_ids(text: str) -> list[str]:
+        """从任意文本中提取全部本子 id（``/jmv`` 批量查询用），去重保序。
 
-        去掉开头的 ``/jmv`` 指令后：
-        1. 优先取 ``album``/``photo``/``jm`` 关键字附近的数字，
-           兼容直接粘贴的站点链接（如 .../album/350234/）；
-        2. 否则取文本中最长的连续数字（至少 4 位），一样长取第一个，
-           尽量避开年份等短数字干扰。
+        1. 优先收集 ``album``/``photo``/``jm`` 关键字附近的数字——
+           一条消息粘贴多条站点链接时每个链接都能识别出车号；
+        2. 无（或仅 1 个）上下文匹配时，退回纯数字识别：多个候选只认
+           5 位以上（避开 2024 等年份干扰），仅 1 个候选时保持旧行为
+           （4 位以上、取最长）。
         """
         body = re.sub(r"^/?jmv\s*", "", text.strip(), count=1, flags=re.IGNORECASE)
-        context_match = re.search(
+        ids = re.findall(
             r"(?:album|photo|jm)[^\d\n]{0,10}?(\d{4,})", body, re.IGNORECASE
         )
-        if context_match:
-            return context_match.group(1)
-        candidates = re.findall(r"\d{4,}", body)
-        if candidates:
-            return max(candidates, key=len)
-        return ""
+        if len(ids) < 2:
+            digit_runs = re.findall(r"\d{4,}", body)
+            if len(digit_runs) >= 2:
+                runs = [d for d in digit_runs if len(d) >= 5]
+                # 无 5 位以上候选时退回旧行为（取最长，避免行为变化）
+                ids = runs if runs else [max(digit_runs, key=len)]
+            elif digit_runs:
+                ids = [max(digit_runs, key=len)]
+        return list(dict.fromkeys(ids))
+
+    @staticmethod
+    def _apply_batch_limit(
+        album_ids: list[str], limit: int
+    ) -> tuple[list[str], list[str]]:
+        """按配置上限截断批量车号，返回 (保留, 被忽略)；上限 <=0 表示无限制。"""
+        if limit <= 0 or len(album_ids) <= limit:
+            return album_ids, []
+        return album_ids[:limit], album_ids[limit:]
+
+    @staticmethod
+    def _batch_limit_note(
+        kept: list[str], dropped: list[str], limit: int, action: str
+    ) -> str:
+        """批量执行的「当前上限」提示后缀；单个且无截断时返回空串。
+
+        - 无上限：``（本次{action}数量不限）``
+        - 有上限未截断：``（{action}上限 N 个）``
+        - 有上限且截断：``（{action}上限 N 个，已忽略 X 个：a、b）``
+        """
+        if len(kept) <= 1 and not dropped:
+            return ""
+        if limit <= 0:
+            return f"（本次{action}数量不限）"
+        if not dropped:
+            return f"（{action}上限 {limit} 个）"
+        return (
+            f"（{action}上限 {limit} 个，已忽略 {len(dropped)} 个："
+            f"{'、'.join(dropped)}）"
+        )
 
     @staticmethod
     async def _send_pdf_with_retry(

@@ -2,7 +2,7 @@ name: astrbot_plugin_jmbot
 display_name: JMBot
 desc: 禁漫下载插件，/jm 支持批量多车号，下载路径与自动清理天数可配置，每日自动签到，WebUI 查看签到结果
 short_desc: 禁漫批量下载，签到/清理可配置，路径可配
-version: 2.5.0
+version: 2.5.1
 author: Sanshui755
 repo: https://github.com/Sanshui755/JMBot-Pro
 support_platforms:
