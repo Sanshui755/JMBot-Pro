@@ -619,7 +619,7 @@ def _webui_tasks_snapshot() -> dict:
         }
 
 
-@register("astrbot_plugin_jmbot", "Sanshui755", "禁漫下载插件，批量下载/搜索翻页/双模型超分辨率/每日签到/自动清理可配", "2.5.2", "")
+@register("astrbot_plugin_jmbot", "Sanshui755", "禁漫下载插件，批量下载/搜索翻页/双模型超分辨率/每日签到/自动清理可配", "2.5.4", "")
 class JMBot(Star):
     """JMBot 插件"""
 
@@ -727,7 +727,7 @@ class JMBot(Star):
         else:
             logger.warning("JMBot 下载产物自动清理已关闭（配置页可重新开启），文件将长期保留")
 
-        logger.info("JMBot v2.5.2 已加载（指令消息已隔离：屏蔽默认 LLM 与陪伴/记忆插件）")
+        logger.info("JMBot v2.5.4 已加载（指令消息已隔离：屏蔽默认 LLM 与陪伴/记忆插件）")
         logger.info(f"JMBot 插件超管: {self.super_user or '(未配置)'}")
         logger.info(f"JMBot 下载目录: {self.download_root}")
 
@@ -2139,13 +2139,12 @@ class JMBot(Star):
             f"（共 {total} 个，当前第 {start + 1}-{shown} 个）："
         ]
         for offset, (aid, title, tags) in enumerate(batch):
-            title_short = (title or "(无标题)")[:40]
-            lines.append(f"{start + offset + 1}. [{aid}] {title_short}")
+            # 标题显示全名，不截断
+            title_full = title or "(无标题)"
+            lines.append(f"{start + offset + 1}. [{aid}] {title_full}")
             if tags:
-                tag_list = [str(t) for t in tags[:5]]
-                tag_text = "、".join(tag_list)
-                if len(tag_text) > 30:
-                    tag_text = tag_text[:30] + "…"
+                # 标签显示全量，不截断
+                tag_text = "、".join(str(t) for t in tags)
                 lines.append(f"   标签：{tag_text}")
 
         if shown < total:
@@ -2544,6 +2543,57 @@ class JMBot(Star):
                 )
             return str(pdf_path), notice
 
+    @staticmethod
+    def _split_oversized_images_for_pdf(
+        image_paths: list[str], temp_dir: Path
+    ) -> list[str]:
+        """把 PDF 换算高度超限的长图切成 PNG，普通图片保持原样。"""
+        from PIL import Image
+
+        # PDF 单页上限为 14400pt，预留余量避免 DPI 取整后再次超限。
+        max_page_height_pt = 14000
+        default_dpi = 96
+        prepared_paths: list[str] = []
+
+        for source_index, image_path in enumerate(image_paths):
+            with Image.open(image_path) as image:
+                dpi = image.info.get("dpi", (default_dpi, default_dpi))
+                try:
+                    x_dpi = int(round(float(dpi[0])))
+                    y_dpi = int(round(float(dpi[1])))
+                except (TypeError, ValueError, IndexError, OverflowError):
+                    x_dpi = y_dpi = default_dpi
+                if x_dpi <= 0:
+                    x_dpi = default_dpi
+                if y_dpi <= 0:
+                    y_dpi = default_dpi
+
+                if image.height * 72 <= max_page_height_pt * y_dpi:
+                    prepared_paths.append(image_path)
+                    continue
+
+                max_chunk_height = max(1, max_page_height_pt * y_dpi // 72)
+                chunk_count = 0
+                for chunk_index, top in enumerate(
+                    range(0, image.height, max_chunk_height)
+                ):
+                    chunk_path = temp_dir / f"{source_index:05d}_{chunk_index:04d}.png"
+                    chunk = image.crop(
+                        (0, top, image.width, min(top + max_chunk_height, image.height))
+                    )
+                    if chunk.mode not in {"1", "L", "LA", "P", "RGB", "RGBA", "I", "I;16"}:
+                        chunk = chunk.convert("RGB")
+                    chunk.save(chunk_path, format="PNG", dpi=(x_dpi, y_dpi))
+                    prepared_paths.append(str(chunk_path))
+                    chunk_count += 1
+
+                logger.info(
+                    f"PDF 长图已切片: {Path(image_path).name} "
+                    f"({image.width}x{image.height}) -> {chunk_count} 段"
+                )
+
+        return prepared_paths
+
     async def _make_pdf(self, album_id: str, image_paths: list[str]) -> str:
         """手动 img2pdf 合并图片为 PDF（不占用下载锁/超分锁）。
 
@@ -2555,8 +2605,24 @@ class JMBot(Star):
 
         def _convert() -> None:
             import img2pdf
-            with open(pdf_path, "wb") as f:
-                f.write(img2pdf.convert(image_paths))
+            import tempfile
+
+            def _safe_layout(imgwidthpx, imgheightpx, ndpi):
+                dimensions = img2pdf.default_layout_fun(imgwidthpx, imgheightpx, ndpi)
+                page_width, page_height = dimensions[:2]
+                # pikepdf 要求页面两边均不小于 3pt，使用 4pt 预留取整余量。
+                # 页面与图像同步缩放，只调整物理尺寸，不改变图片像素和宽高比。
+                scale = max(1.0, 4.0 / page_width, 4.0 / page_height)
+                return tuple(value * scale for value in dimensions)
+
+            with tempfile.TemporaryDirectory(
+                prefix=".jmbot_pdf_chunks_", dir=pdf_path.parent
+            ) as temp_dir:
+                prepared_paths = self._split_oversized_images_for_pdf(
+                    image_paths, Path(temp_dir)
+                )
+                with open(pdf_path, "wb") as f:
+                    f.write(img2pdf.convert(prepared_paths, layout_fun=_safe_layout))
 
         await asyncio.to_thread(_convert)
         return str(pdf_path.resolve())
